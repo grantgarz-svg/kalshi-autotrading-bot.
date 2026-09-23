@@ -1,3 +1,4 @@
+```python
 import streamlit as st
 import requests
 import time
@@ -26,15 +27,15 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with live PnL tracking")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with defensive filters")
 
 
 # ============================================================
 # CONSTANTS
 # ============================================================
 
-PROD_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
-DEMO_BASE_URL = "https://external-api.demo.kalshi.co/trade-api/v2"
+PROD_BASE_URL = "[https://external-api.kalshi.com/trade-api/v2](https://external-api.kalshi.com/trade-api/v2)"
+DEMO_BASE_URL = "[https://external-api.demo.kalshi.co/trade-api/v2](https://external-api.demo.kalshi.co/trade-api/v2)"
 
 LOG_FILE = Path("kalshi_orders.csv")
 ZERO = Decimal("0")
@@ -54,8 +55,8 @@ DEFAULTS = {
     "emergency_stop": False,
     "logs": [],
     "paper_trades": [],
-    "paper_positions": {},      # Tracks active paper positions: ticker -> {contracts, avg_cost, outcome}
-    "paper_realized_pnl": ZERO, # Total locked-in paper profit/loss
+    "paper_positions": {},      
+    "paper_realized_pnl": ZERO, 
     "last_trade_time": None,
     "last_price": None,
     "active_ticker": None,
@@ -63,6 +64,8 @@ DEFAULTS = {
     "last_client_order_id": None,
     "last_fill_count": ZERO,
     "bot_positions": {},
+    "blacklisted_tickers": set(),
+    "last_status_log": None,
 }
 
 for key, value in DEFAULTS.items():
@@ -93,6 +96,10 @@ def log(message):
     st.session_state.logs.append(line)
     st.session_state.logs = st.session_state.logs[-100:]
 
+def log_once(msg_key, message):
+    if st.session_state.get("last_status_log") != msg_key:
+        log(message)
+        st.session_state["last_status_log"] = msg_key
 
 def append_order_log(row):
     fields = [
@@ -669,6 +676,11 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
         filled, remaining, status = confirm_fill(client, result["order_id"])
         log(f"{reason} exit confirmation: filled={filled}, remaining={remaining}, status={status}")
 
+    # Immediately blacklist the ticker so the bot stops averaging down into dying contracts
+    if reason == "STOP LOSS":
+        st.session_state.blacklisted_tickers.add(ticker)
+        st.session_state["last_status_log"] = None 
+
     return True
 
 
@@ -697,7 +709,14 @@ with st.sidebar:
     st.header("💰 Risk Settings")
     max_dollars_trade = st.number_input("Maximum dollars per trade", min_value=0.01, max_value=10000.00, value=10.00, step=1.00)
     daily_cap = st.number_input("Daily spending cap", min_value=0.01, max_value=100000.00, value=100.00, step=5.00)
-    max_entry = st.slider("Maximum entry price", min_value=1, max_value=99, value=75, format="%d¢")
+    
+    c_entry1, c_entry2 = st.columns(2)
+    with c_entry1:
+        min_entry = st.slider("Min entry price", min_value=1, max_value=99, value=15, format="%d¢")
+    with c_entry2:
+        max_entry = st.slider("Max entry price", min_value=1, max_value=99, value=65, format="%d¢")
+        
+    max_spread = st.slider("Max Bid/Ask Spread", min_value=1, max_value=50, value=5, format="%d¢")
     cooldown = st.slider("Cooldown between entries", min_value=10, max_value=1800, value=60, step=10, format="%d seconds")
     min_minutes_to_expiry = st.number_input("Do not enter if expiration is closer than", min_value=0.0, max_value=120.0, value=2.0, step=0.5)
     take_profit_pct = st.number_input("Take profit %", min_value=0.0, max_value=500.0, value=20.0, step=1.0)
@@ -796,13 +815,18 @@ def run_bot_cycle(client, daily_spent):
         )
 
         if not market or entry_price <= 0 or entry_price >= 100:
+            log_once("no_market", f"Scanning {series_ticker}: Waiting for active liquidity...")
             return
 
         ticker = market.get("ticker")
         st.session_state.active_ticker = ticker
         st.session_state.last_price = entry_price
     except Exception as error:
-        log(f"Market discovery error: {error}")
+        log_once("discovery_err", f"Market discovery error: {error}")
+        return
+
+    # Check Blacklist before making API calls
+    if ticker in st.session_state.blacklisted_tickers:
         return
 
     # ==========================================
@@ -819,7 +843,7 @@ def run_bot_cycle(client, daily_spent):
             fills = fills_response.get("fills", [])
             avg_entry = reconstruct_average_entry(fills, ticker, outcome_to_trade)
         except Exception as error:
-            log(f"Position/fill error: {error}")
+            log_once("pos_err", f"Position/fill error: {error}")
             return
     else:
         p_pos = st.session_state.paper_positions.get(ticker, {"contracts": ZERO, "avg_cost": ZERO, "outcome": outcome_to_trade})
@@ -850,20 +874,34 @@ def run_bot_cycle(client, daily_spent):
         return
 
     # ==========================================
-    # ENTRY LOGIC
+    # ENTRY LOGIC & DEFENSIVE FILTERS
     # ==========================================
-    signal = entry_price <= max_entry
-    if signal and st.session_state.last_trade_time:
+    signal = True
+    live_bid = get_live_bid_price(client, ticker, outcome_to_trade)
+    spread = entry_price - live_bid
+
+    if not (min_entry <= entry_price <= max_entry):
+        signal = False
+        log_once("limits", f"{ticker}: Ask {entry_price}¢ outside limits ({min_entry}¢-{max_entry}¢).")
+    elif spread > max_spread:
+        signal = False
+        log_once("spread_abs", f"{ticker}: Spread {spread}¢ exceeds absolute max {max_spread}¢. Ask:{entry_price}¢ Bid:{live_bid}¢.")
+    elif live_bid <= (entry_price * (1 - stop_loss_pct / 100)):
+        signal = False
+        log_once("spread_sl", f"{ticker}: Bid ({live_bid}¢) is too low. Would instantly trigger {stop_loss_pct}% Stop Loss.")
+    elif st.session_state.last_trade_time:
         elapsed = (now_utc() - st.session_state.last_trade_time).total_seconds()
         if elapsed < cooldown:
             signal = False
+            log_once("cooldown", f"{ticker}: Cooldown active ({int(cooldown - elapsed)}s remaining).")
 
     if signal:
+        st.session_state["last_status_log"] = None
         remaining_daily = D(daily_cap) - daily_spent
         contracts = calculate_contracts(D(max_dollars_trade), entry_price, remaining_daily)
 
         if contracts <= 0:
-            log("Entry blocked: daily cap or trade limit does not allow even one contract.")
+            log_once("blocked", "Entry blocked: daily cap or trade limit does not allow even one contract.")
         else:
             estimated_cost = D(contracts) * D(entry_price) / D(100)
             log(f"ENTRY SIGNAL: BUY {contracts} {outcome_to_trade} {ticker} @ {entry_price}¢ (~${estimated_cost:.2f})")
@@ -890,8 +928,6 @@ def run_bot_cycle(client, daily_spent):
                     st.session_state.emergency_stop = True
                     st.session_state.running = False
                     st.rerun()
-    else:
-        log(f"{ticker}: {outcome_to_trade} ask {entry_price}¢ > max limit {max_entry}¢ or cooldown active.")
 
 
 @st.fragment(run_every=3)
@@ -910,7 +946,6 @@ def render_dashboard_and_tick():
                 st.session_state.running = False
                 st.rerun()
 
-    # FIX: Robust fallback using .get() prevents KeyError if older entries only have "Cost" instead of "Cost/Value"
     if client and trading_mode == "LIVE TRADING":
         try:
             daily_spent = calculate_daily_spend(client)
