@@ -317,8 +317,8 @@ class KalshiClient:
             "ticker": ticker,
             "client_order_id": client_order_id,
             "side": book_side,
-            "count": f"{D(contracts):.2f}",
-            "price": f"{D(price_dollars):.4f}",
+            "count": int(contracts),
+            "price": int(D(price_dollars) * 100),
             "time_in_force": "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
             "reduce_only": bool(reduce_only),
@@ -347,18 +347,20 @@ def find_active_market(markets):
         if m.get("status") in (None, "open", "active")
     ]
 
-    if not open_markets:
+    valid_markets = []
+    for m in open_markets:
+        mins = market_minutes_remaining(m)
+        # Filter out markets whose trading window has already passed
+        if mins is not None and mins > 0:
+            valid_markets.append(m)
+
+    if not valid_markets:
         return None
 
-    open_markets.sort(
-        key=lambda m: (
-            m.get("close_time")
-            or m.get("expiration_time")
-            or "9999"
-        )
-    )
+    # Sort by the closest closing time, ensuring we get the current 15-minute window
+    valid_markets.sort(key=lambda m: market_minutes_remaining(m))
 
-    return open_markets[0]
+    return valid_markets[0]
 
 
 def parse_time(value):
@@ -1103,10 +1105,13 @@ with st.sidebar:
         value="KXBTC15M",
     )
 
-    outcome_to_trade = st.selectbox(
+    display_outcome = st.selectbox(
         "Entry outcome",
-        ["YES", "NO"],
+        ["UP", "DOWN"],
     )
+    
+    # Map the UI choice back to the API's backend format
+    outcome_to_trade = "YES" if display_outcome == "UP" else "NO"
 
     st.divider()
 
