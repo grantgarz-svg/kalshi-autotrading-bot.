@@ -287,10 +287,6 @@ def get_live_ask_price(client, ticker, outcome_to_trade):
 
 
 def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, outcome_to_trade="YES"):
-    """
-    Scans all open markets, groups them by expiry window, and actively loops 
-    through strikes to return the first ticker that has active liquidity (ask > 0).
-    """
     markets = []
     try:
         res = client.get_markets(series_ticker=series_ticker)
@@ -306,7 +302,7 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         except Exception:
             pass
 
-    open_markets = [m for m in markets if m.get("status"] in (None, "open", "active")]
+    open_markets = [m for m in markets if m.get("status") in (None, "open", "active")]
     valid_markets = [m for m in open_markets if market_minutes_remaining(m) is not None and market_minutes_remaining(m) > min_expiry_mins]
 
     if not valid_markets:
@@ -326,14 +322,12 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         current_window = windows[w_key]
         current_window.sort(key=lambda x: x.get("ticker", ""))
         
-        # Loop through every strike in the window to find one with an active ask price
         for m in current_window:
             t = m.get("ticker")
             ask = get_live_ask_price(client, t, outcome_to_trade)
             if 0 < ask < 100:
                 return m, ask
 
-    # Fallback to the closest expiration middle strike if absolute liquidity wasn't caught
     if sorted_windows:
         fallback_window = windows[sorted_windows[0]]
         if fallback_window:
@@ -763,13 +757,11 @@ def run_bot_cycle(client, daily_spent):
         return
 
     try:
-        # Scan and find a market that has active liquidity for our outcome
         market, entry_price = find_active_market_with_liquidity(
             client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), outcome_to_trade=outcome_to_trade
         )
 
         if not market or entry_price <= 0 or entry_price >= 100:
-            # Silent check to prevent log spam when waiting for liquidity
             return
 
         ticker = market.get("ticker")
