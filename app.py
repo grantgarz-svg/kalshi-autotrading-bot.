@@ -226,7 +226,7 @@ class KalshiClient:
             "/markets",
             params={
                 "series_ticker": series_ticker,
-                "status": "open",
+                "status": "active",
                 "limit": 100,
             },
         )
@@ -344,7 +344,7 @@ class KalshiClient:
 def find_active_market(markets):
     open_markets = [
         m for m in markets
-        if m.get("status") in (None, "open")
+        if m.get("status") in (None, "active")
     ]
 
     if not open_markets:
