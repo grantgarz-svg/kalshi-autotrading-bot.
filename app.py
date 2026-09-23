@@ -221,13 +221,14 @@ class KalshiClient:
         return self.request("GET", f"/portfolio/orders/{order_id}")
 
     def create_v2_order(self, ticker, client_order_id, book_side, contracts, price_dollars, reduce_only=False):
+        # FIXED: Format price strictly to 4 decimal places (e.g. 0.6 -> 0.6000) to satisfy API V2 Precision Requirements
+        formatted_price = f"{float(price_dollars):.4f}"
         body = {
             "ticker": ticker,
             "client_order_id": client_order_id,
             "side": book_side,
             "count": str(int(contracts)),
-            # FIXED: Kalshi's backend strict unmarshaling requires price to be a string formatted decimal
-            "price": str(price_dollars),
+            "price": formatted_price,
             "time_in_force": "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
             "reduce_only": bool(reduce_only),
@@ -789,7 +790,6 @@ def run_bot_cycle(client, daily_spent):
         ticker = market.get("ticker")
         st.session_state.active_ticker = ticker
         st.session_state.last_price = entry_price
-        log(f"Found active liquidity: {ticker} | Best {outcome_to_trade} Ask: {entry_price}¢")
     except Exception as error:
         log(f"Market discovery error: {error}")
         return
@@ -810,7 +810,14 @@ def run_bot_cycle(client, daily_spent):
                 st.session_state.last_trade_time = now_utc()
                 return
         except Exception as error:
+            error_str = str(error).lower()
             log(f"TP/SL error: {error}")
+            if "insufficient balance" in error_str or "insufficient_balance" in error_str:
+                log("🛑 STOPPING BOT: Insufficient balance on TP/SL.")
+                st.session_state.emergency_stop = True
+                st.session_state.running = False
+                st.rerun()
+                return
 
     already_in_target_position = (position["contracts"] > 0 and position["outcome"] == outcome_to_trade)
     if already_in_target_position:
@@ -848,7 +855,13 @@ def run_bot_cycle(client, daily_spent):
                 else:
                     st.session_state.bot_positions[ticker] = {"outcome": outcome_to_trade, "contracts": str(contracts)}
             except Exception as e:
+                error_str = str(e).lower()
                 log(f"Order submission error exception caught: {e}")
+                if "insufficient balance" in error_str or "insufficient_balance" in error_str:
+                    log("🛑 STOPPING BOT: Insufficient balance. Please deposit funds or switch to Paper Trading.")
+                    st.session_state.emergency_stop = True
+                    st.session_state.running = False
+                    st.rerun()
     else:
         log(f"{ticker}: {outcome_to_trade} ask {entry_price}¢ > max limit {max_entry}¢ or cooldown active.")
 
