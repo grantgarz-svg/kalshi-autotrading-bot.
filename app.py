@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 import requests
 import time
@@ -34,8 +33,8 @@ st.caption("Production-hardened paper/live Kalshi trading dashboard with defensi
 # CONSTANTS
 # ============================================================
 
-PROD_BASE_URL = "[https://external-api.kalshi.com/trade-api/v2](https://external-api.kalshi.com/trade-api/v2)"
-DEMO_BASE_URL = "[https://external-api.demo.kalshi.co/trade-api/v2](https://external-api.demo.kalshi.co/trade-api/v2)"
+PROD_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
+DEMO_BASE_URL = "https://external-api.demo.kalshi.co/trade-api/v2"
 
 LOG_FILE = Path("kalshi_orders.csv")
 ZERO = Decimal("0")
