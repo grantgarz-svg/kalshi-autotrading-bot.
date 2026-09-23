@@ -1,6 +1,4 @@
-from pathlib import Path
-
-app_code = r'''import streamlit as st
+import streamlit as st
 import requests
 import time
 import datetime as dt
@@ -1782,15 +1780,3 @@ else:
             file_name="kalshi_orders.csv",
             mime="text/csv",
         )
-'''
-Path("/mnt/data/app.py").write_text(app_code, encoding="utf-8")
-
-requirements = """streamlit>=1.42,<2
-requests>=2.32,<3
-cryptography>=43,<48
-"""
-Path("/mnt/data/requirements.txt").write_text(requirements, encoding="utf-8")
-
-print("Created:")
-print("/mnt/data/app.py")
-print("/mnt/data/requirements.txt")
