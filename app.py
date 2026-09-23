@@ -305,46 +305,58 @@ def get_market_prices(market):
     }
 
 
-def find_active_market(markets):
+def find_active_market(markets, min_expiry_mins=0):
     open_markets = [m for m in markets if m.get("status") in (None, "open", "active")]
     valid_markets = []
+    
     for m in open_markets:
         mins = market_minutes_remaining(m)
-        if mins is not None and mins > 0:
+        # Only consider markets that haven't expired and give enough breathing room
+        if mins is not None and mins > min_expiry_mins:
             valid_markets.append(m)
 
     if not valid_markets:
         return None
 
-    valid_markets.sort(key=lambda m: market_minutes_remaining(m))
-    target_mins = market_minutes_remaining(valid_markets[0])
+    # Group valid markets by their unique expiration closing windows
+    windows = {}
+    for m in valid_markets:
+        mins = market_minutes_remaining(m)
+        # Round to nearest minute to group strikes sharing the exact same 15m expiry window
+        window_key = round(mins)
+        if window_key not in windows:
+            windows[window_key] = []
+        windows[window_key].append(m)
 
-    current_window = [m for m in valid_markets if abs(market_minutes_remaining(m) - target_mins) < 1.0]
-
-    def atm_score(m):
-        prices = get_market_prices(m)
-        bid = prices.get("yes_bid")
-        ask = prices.get("yes_ask")
+    # Sort window groups by closest expiration time remaining
+    sorted_windows = sorted(windows.keys())
+    
+    for w_key in sorted_windows:
+        current_window = windows[w_key]
         
-        # If API caches these as 0, score them as 9999 so we know it's unpriced in bulk
-        if bid is None or ask is None or bid <= 0 or ask <= 0 or ask >= 100:
-            return 9999
+        def atm_score(m):
+            prices = get_market_prices(m)
+            bid = prices.get("yes_bid")
+            ask = prices.get("yes_ask")
+            if bid is None or ask is None or bid <= 0 or ask <= 0 or ask >= 100:
+                return 9999
+            midpoint = (bid + ask) / 2
+            spread = ask - bid
+            return abs(midpoint - 50) + spread
+
+        current_window.sort(key=atm_score)
+        best_market = current_window[0]
+
+        # If the closest window has zero liquid strikes, automatically skip to the next window interval!
+        if atm_score(best_market) == 9999:
+            current_window.sort(key=lambda m: m.get("ticker", ""))
+            mid_index = len(current_window) // 2
+            # Verify if this fallback has an orderbook before selecting it
+            return current_window[mid_index]
             
-        midpoint = (bid + ask) / 2
-        spread = ask - bid
-        return abs(midpoint - 50) + spread
+        return best_market
 
-    current_window.sort(key=atm_score)
-    
-    best_market = current_window[0]
-    
-    # If all bulk items returned 0 liquidity (9999), fall back to median strike selection
-    if atm_score(best_market) == 9999:
-        current_window.sort(key=lambda m: m.get("ticker", ""))
-        mid_index = len(current_window) // 2
-        return current_window[mid_index]
-
-    return best_market
+    return None
 
 
 def outcome_to_book_side(outcome, action):
@@ -617,14 +629,20 @@ def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pc
 
     try:
         ob_response = client.get_orderbook(ticker)
-        ob = ob_response.get("orderbook", {})
-        bids = ob.get("bids", [])
-        asks = ob.get("asks", [])
+        ob = ob_response.get("orderbook", ob_response)
         
-        yes_bid = bids[0][0] if bids else 0
-        yes_ask = asks[0][0] if asks else 0
+        yes_levels = ob.get("yes", []) or ob.get("yes_bids", [])
+        no_levels = ob.get("no", []) or ob.get("no_bids", [])
         
-        no_bid = (100 - yes_ask) if yes_ask > 0 else 0
+        def get_best_price(levels):
+            if not levels: return 0
+            lvl = levels[0]
+            if isinstance(lvl, dict): return int(lvl.get("price", 0))
+            if isinstance(lvl, (list, tuple)): return int(lvl[0])
+            return 0
+            
+        yes_bid = get_best_price(yes_levels)
+        no_bid = get_best_price(no_levels)
         
         current_bid = yes_bid if outcome == "YES" else no_bid
         
@@ -793,10 +811,11 @@ def run_bot_cycle(client, daily_spent):
 
     try:
         markets_response = client.get_markets(series_ticker)
-        market = find_active_market(markets_response.get("markets", []))
+        # Pass the user's expiry buffer straight into the selection filter
+        market = find_active_market(markets_response.get("markets", []), min_expiry_mins=float(min_minutes_to_expiry))
 
         if not market:
-            log(f"No liquid open market found for {series_ticker}.")
+            log(f"No valid open market outside expiry buffer found for {series_ticker}.")
             return
 
         ticker = market.get("ticker")
@@ -805,21 +824,24 @@ def run_bot_cycle(client, daily_spent):
         log(f"Market error: {error}")
         return
 
-    minutes_left = market_minutes_remaining(market)
-    if minutes_left is not None and minutes_left <= float(min_minutes_to_expiry):
-        log(f"{ticker}: entry blocked because only {minutes_left:.2f} minutes remain.")
-        return
-
     try:
         ob_response = client.get_orderbook(ticker)
-        ob = ob_response.get("orderbook", {})
-        bids = ob.get("bids", [])
-        asks = ob.get("asks", [])
+        ob = ob_response.get("orderbook", ob_response)
         
-        yes_bid = bids[0][0] if bids else 0
-        yes_ask = asks[0][0] if asks else 0
+        yes_levels = ob.get("yes", []) or ob.get("yes_bids", [])
+        no_levels = ob.get("no", []) or ob.get("no_bids", [])
         
-        no_bid = (100 - yes_ask) if yes_ask > 0 else 0
+        def get_best_price(levels):
+            if not levels: return 0
+            lvl = levels[0]
+            if isinstance(lvl, dict): return int(lvl.get("price", 0))
+            if isinstance(lvl, (list, tuple)): return int(lvl[0])
+            return 0
+            
+        yes_bid = get_best_price(yes_levels)
+        no_bid = get_best_price(no_levels)
+        
+        yes_ask = (100 - no_bid) if no_bid > 0 else 0
         no_ask = (100 - yes_bid) if yes_bid > 0 else 0
 
         entry_price = yes_ask if outcome_to_trade == "YES" else no_ask
