@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with multi-strike liquidity scanning")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with live activity logging")
 
 
 # ============================================================
@@ -757,16 +757,19 @@ def run_bot_cycle(client, daily_spent):
         return
 
     try:
+        log(f"Scanning {series_ticker} for active markets and liquidity...")
         market, entry_price = find_active_market_with_liquidity(
             client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), outcome_to_trade=outcome_to_trade
         )
 
         if not market or entry_price <= 0 or entry_price >= 100:
+            log(f"Waiting for liquidity or valid price window on {series_ticker}...")
             return
 
         ticker = market.get("ticker")
         st.session_state.active_ticker = ticker
         st.session_state.last_price = entry_price
+        log(f"Found active market: {ticker} | Best Ask: {entry_price}¢")
     except Exception as error:
         log(f"Market discovery error: {error}")
         return
@@ -826,6 +829,8 @@ def run_bot_cycle(client, daily_spent):
                     st.session_state.bot_positions[ticker] = {"outcome": outcome_to_trade, "contracts": str(contracts)}
             except Exception as e:
                 log(f"Order submission error exception caught: {e}")
+    else:
+        log(f"{ticker}: {outcome_to_trade} ask {entry_price}¢ > max limit {max_entry}¢ or cooldown active.")
 
 
 @st.fragment(run_every=3)
