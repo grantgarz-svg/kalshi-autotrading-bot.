@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with precise API v2 orderbook mapping")
+st.caption("Production-hardened paper/live Kalshi trading dashboard")
 
 
 # ============================================================
@@ -225,7 +225,7 @@ class KalshiClient:
             "ticker": ticker,
             "client_order_id": client_order_id,
             "side": book_side,
-            "count": int(contracts),
+            "count": str(int(contracts)),  # FIXED: Kalshi requires count as string
             "price": int(D(price_dollars) * 100),
             "time_in_force": "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
@@ -268,7 +268,6 @@ def get_live_ask_price(client, ticker, outcome_to_trade):
     try:
         res = client.get_orderbook(ticker)
         
-        # Kalshi V2 puts the strings in `orderbook_fp` under `yes_dollars` and `no_dollars`
         ob = res.get("orderbook_fp") or res.get("orderbook") or res
         
         yes_levels = ob.get("yes_dollars") or ob.get("yes") or []
@@ -277,12 +276,10 @@ def get_live_ask_price(client, ticker, outcome_to_trade):
         def extract_best(levels):
             if not levels: return 0
             
-            # CRITICAL FIX: The arrays are sorted ascending. The BEST bid is the LAST element.
             lvl = levels[-1] 
             
-            # Standard V2 FP arrays return `["0.4200", "13.00"]`
             if isinstance(lvl, (list, tuple)): 
-                return int(float(lvl[0]) * 100) # Convert "0.4200" -> 42 cents
+                return int(float(lvl[0]) * 100) 
             
             if isinstance(lvl, dict): 
                 return int(float(lvl.get("price", 0)) * 100)
@@ -292,7 +289,6 @@ def get_live_ask_price(client, ticker, outcome_to_trade):
         yes_bid = extract_best(yes_levels)
         no_bid = extract_best(no_levels)
         
-        # Binary math: Yes Ask = 100 - No Bid
         yes_ask = (100 - no_bid) if no_bid > 0 else 0
         no_ask = (100 - yes_bid) if yes_bid > 0 else 0
 
@@ -323,7 +319,6 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
     valid_markets = [m for m in open_markets if market_minutes_remaining(m) is not None and market_minutes_remaining(m) > min_expiry_mins]
 
     if not valid_markets:
-        # Fallback to catching expiring markets if the buffer is empty
         valid_markets = [m for m in open_markets if market_minutes_remaining(m) is not None and market_minutes_remaining(m) > 0]
 
     if not valid_markets:
@@ -344,7 +339,6 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         current_window.sort(key=lambda x: x.get("ticker", ""))
         
         if current_window:
-            # 1. Look at the At-The-Money strike first to save rate-limits
             mid_idx = len(current_window) // 2
             atm_market = current_window[mid_idx]
             
@@ -352,9 +346,8 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
             if 0 < ask < 100:
                 return atm_market, ask
                 
-            time.sleep(0.1) # 100ms pause to respect 10req/sec limits
+            time.sleep(0.1)
 
-            # 2. If ATM is empty, scan the rest of the window
             for m in current_window:
                 if m == atm_market:
                     continue
@@ -615,7 +608,6 @@ def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pc
     try:
         res = client.get_orderbook(ticker)
         ob = res.get("orderbook_fp") or res.get("orderbook") or res
-        
         yes_levels = ob.get("yes_dollars") or ob.get("yes") or []
         no_levels = ob.get("no_dollars") or ob.get("no") or []
         
@@ -791,7 +783,6 @@ def run_bot_cycle(client, daily_spent):
         )
 
         if not market or entry_price <= 0 or entry_price >= 100:
-            log(f"Scanning {series_ticker}: No valid liquid markets found. Waiting...")
             return
 
         ticker = market.get("ticker")
