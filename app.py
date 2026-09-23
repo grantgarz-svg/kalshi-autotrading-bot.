@@ -305,13 +305,12 @@ def get_market_prices(market):
     }
 
 
-def find_active_market(markets, min_expiry_mins=0):
+def find_active_market(client, markets, min_expiry_mins=0):
     open_markets = [m for m in markets if m.get("status") in (None, "open", "active")]
     valid_markets = []
     
     for m in open_markets:
         mins = market_minutes_remaining(m)
-        # Only consider markets that haven't expired and give enough breathing room
         if mins is not None and mins > min_expiry_mins:
             valid_markets.append(m)
 
@@ -322,39 +321,32 @@ def find_active_market(markets, min_expiry_mins=0):
     windows = {}
     for m in valid_markets:
         mins = market_minutes_remaining(m)
-        # Round to nearest minute to group strikes sharing the exact same 15m expiry window
         window_key = round(mins)
         if window_key not in windows:
             windows[window_key] = []
         windows[window_key].append(m)
 
-    # Sort window groups by closest expiration time remaining
     sorted_windows = sorted(windows.keys())
     
     for w_key in sorted_windows:
         current_window = windows[w_key]
         
-        def atm_score(m):
-            prices = get_market_prices(m)
-            bid = prices.get("yes_bid")
-            ask = prices.get("yes_ask")
-            if bid is None or ask is None or bid <= 0 or ask <= 0 or ask >= 100:
-                return 9999
-            midpoint = (bid + ask) / 2
-            spread = ask - bid
-            return abs(midpoint - 50) + spread
+        # Check orderbooks live to find the first genuinely liquid strike in this window
+        for m in current_window:
+            t = m.get("ticker")
+            try:
+                ob_res = client.get_orderbook(t)
+                ob = ob_res.get("orderbook", ob_res)
+                y_levels = ob.get("yes", []) or ob.get("yes_bids", [])
+                n_levels = ob.get("no", []) or ob.get("no_bids", [])
+                if y_levels or n_levels:
+                    return m
+            except Exception:
+                continue
 
-        current_window.sort(key=atm_score)
-        best_market = current_window[0]
-
-        # If the closest window has zero liquid strikes, automatically skip to the next window interval!
-        if atm_score(best_market) == 9999:
-            current_window.sort(key=lambda m: m.get("ticker", ""))
-            mid_index = len(current_window) // 2
-            # Verify if this fallback has an orderbook before selecting it
-            return current_window[mid_index]
-            
-        return best_market
+        # If none of the strikes in this window returned orderbook data, fallback to first in window
+        if current_window:
+            return current_window[0]
 
     return None
 
@@ -811,11 +803,10 @@ def run_bot_cycle(client, daily_spent):
 
     try:
         markets_response = client.get_markets(series_ticker)
-        # Pass the user's expiry buffer straight into the selection filter
-        market = find_active_market(markets_response.get("markets", []), min_expiry_mins=float(min_minutes_to_expiry))
+        market = find_active_market(client, markets_response.get("markets", []), min_expiry_mins=float(min_minutes_to_expiry))
 
         if not market:
-            log(f"No valid open market outside expiry buffer found for {series_ticker}.")
+            log(f"No liquid open market found for {series_ticker}.")
             return
 
         ticker = market.get("ticker")
