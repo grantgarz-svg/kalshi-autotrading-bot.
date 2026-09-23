@@ -304,34 +304,21 @@ def find_active_market(markets):
     def atm_score(m):
         bid = m.get("yes_bid")
         ask = m.get("yes_ask")
-        if bid is None or ask is None or bid == 0 or ask >= 100:
+        # Strict liquidity check: must have valid ints > 0
+        if bid is None or ask is None or bid <= 0 or ask <= 0 or ask >= 100:
             return 9999
         midpoint = (bid + ask) / 2
         spread = ask - bid
         return abs(midpoint - 50) + spread
 
     current_window.sort(key=atm_score)
-    return current_window[0]
+    
+    best_market = current_window[0]
+    # If the score is 9999, none of the contracts have liquidity.
+    if atm_score(best_market) == 9999:
+        return None
 
-
-def get_market_prices(market):
-    yes_bid = market.get("yes_bid")
-    yes_ask = market.get("yes_ask")
-    no_bid = market.get("no_bid")
-    no_ask = market.get("no_ask")
-
-    if yes_ask is None and no_bid is not None:
-        yes_ask = 100 - int(no_bid)
-
-    if no_ask is None and yes_bid is not None:
-        no_ask = 100 - int(yes_bid)
-
-    return {
-        "yes_bid": int(yes_bid) if yes_bid is not None else None,
-        "yes_ask": int(yes_ask) if yes_ask is not None else None,
-        "no_bid": int(no_bid) if no_bid is not None else None,
-        "no_ask": int(no_ask) if no_ask is not None else None,
-    }
+    return best_market
 
 
 def outcome_to_book_side(outcome, action):
@@ -591,7 +578,7 @@ def confirm_fill(client, order_id, timeout_seconds=4):
     return ZERO, ZERO, "unknown"
 
 
-def manage_position(client, mode, market, position, fills, take_profit_pct, stop_loss_pct):
+def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pct):
     if position["contracts"] <= 0:
         return False
 
@@ -602,10 +589,25 @@ def manage_position(client, mode, market, position, fills, take_profit_pct, stop
     if outcome not in ("YES", "NO"):
         return False
 
-    prices = get_market_prices(market)
-    current_bid = prices["yes_bid"] if outcome == "YES" else prices["no_bid"]
-
-    if current_bid is None or current_bid <= 0:
+    try:
+        # Fetch live orderbook instead of relying on the stale market object
+        ob_response = client.get_orderbook(ticker)
+        ob = ob_response.get("orderbook", {})
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+        
+        yes_bid = bids[0][0] if bids else 0
+        yes_ask = asks[0][0] if asks else 0
+        
+        no_bid = (100 - yes_ask) if yes_ask > 0 else 0
+        
+        current_bid = yes_bid if outcome == "YES" else no_bid
+        
+        if current_bid <= 0:
+            return False
+            
+    except Exception as error:
+        log(f"TP/SL price fetch error: {error}")
         return False
 
     entry = reconstruct_average_entry(fills, ticker, outcome)
@@ -769,7 +771,7 @@ def run_bot_cycle(client, daily_spent):
         market = find_active_market(markets_response.get("markets", []))
 
         if not market:
-            log(f"No open market for {series_ticker}.")
+            log(f"No liquid open market found for {series_ticker}.")
             return
 
         ticker = market.get("ticker")
@@ -784,15 +786,22 @@ def run_bot_cycle(client, daily_spent):
         return
 
     try:
-        prices = get_market_prices(market)
-        entry_price = prices["yes_ask"] if outcome_to_trade == "YES" else prices["no_ask"]
+        # Fetch the live orderbook explicitly rather than trusting static market endpoints
+        ob_response = client.get_orderbook(ticker)
+        ob = ob_response.get("orderbook", {})
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+        
+        yes_bid = bids[0][0] if bids else 0
+        yes_ask = asks[0][0] if asks else 0
+        
+        # Calculate NO prices from YES book (Kalshi V2 single book math)
+        no_bid = (100 - yes_ask) if yes_ask > 0 else 0
+        no_ask = (100 - yes_bid) if yes_bid > 0 else 0
 
-        if entry_price is None:
-            detail = client.get_market(ticker)
-            prices = get_market_prices(detail.get("market", detail))
-            entry_price = prices["yes_ask"] if outcome_to_trade == "YES" else prices["no_ask"]
+        entry_price = yes_ask if outcome_to_trade == "YES" else no_ask
 
-        if entry_price is None:
+        if not entry_price or entry_price <= 0 or entry_price >= 100:
             log(f"{ticker}: no {outcome_to_trade} ask.")
             return
 
@@ -812,7 +821,7 @@ def run_bot_cycle(client, daily_spent):
 
     if position["contracts"] > 0 and (manage_existing or ticker in st.session_state.bot_positions):
         try:
-            exited = manage_position(client, trading_mode, market, position, fills, take_profit_pct, stop_loss_pct)
+            exited = manage_position(client, trading_mode, position, fills, take_profit_pct, stop_loss_pct)
             if exited:
                 st.session_state.last_trade_time = now_utc()
                 return
