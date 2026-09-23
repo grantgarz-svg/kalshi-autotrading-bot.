@@ -305,7 +305,11 @@ def get_market_prices(market):
     }
 
 
-def find_active_market(markets, min_expiry_mins=0):
+def find_active_market(client, markets, min_expiry_mins=0, outcome_to_trade="YES"):
+    """
+    Scans open markets, groups them by expiry window, and checks individual 
+    order books to find the first strike with real active liquidity for the desired outcome.
+    """
     open_markets = [m for m in markets if m.get("status") in (None, "open", "active")]
     valid_markets = []
     
@@ -329,10 +333,31 @@ def find_active_market(markets, min_expiry_mins=0):
     
     for w_key in sorted_windows:
         current_window = windows[w_key]
+        # Sort strikes numerically/alphabetically for consistent scanning order
+        current_window.sort(key=lambda x: x.get("ticker", ""))
+        
+        # Actively scan strikes in this window for real liquidity
+        for m in current_window:
+            t = m.get("ticker")
+            try:
+                detail = client.get_market(t)
+                m_detail = detail.get("market", detail)
+                prices = get_market_prices(m_detail)
+                
+                ask_price = prices["yes_ask"] if outcome_to_trade == "YES" else prices["no_ask"]
+                if ask_price is not None and 0 < ask_price < 100:
+                    return m_detail # Found a liquid strike with a valid ask!
+            except Exception:
+                continue
+                
+        # Fallback to the middle strike of the window if no deep prices caught cleanly
         if current_window:
-            # Pick the middle strike of the active window cluster
-            current_window.sort(key=lambda x: x.get("ticker", ""))
-            return current_window[len(current_window) // 2]
+            try:
+                t = current_window[len(current_window) // 2].get("ticker")
+                det = client.get_market(t)
+                return det.get("market", det)
+            except Exception:
+                return current_window[0]
 
     return None
 
@@ -776,7 +801,8 @@ def run_bot_cycle(client, daily_spent):
 
     try:
         markets_response = client.get_markets(series_ticker)
-        market = find_active_market(markets_response.get("markets", []), min_expiry_mins=float(min_minutes_to_expiry))
+        # Pass outcome_to_trade so the scanner specifically targets strikes with active quotes for our side
+        market = find_active_market(client, markets_response.get("markets", []), min_expiry_mins=float(min_minutes_to_expiry), outcome_to_trade=outcome_to_trade)
 
         if not market:
             log(f"No active open market found for {series_ticker}.")
@@ -788,12 +814,8 @@ def run_bot_cycle(client, daily_spent):
         log(f"Market error: {error}")
         return
 
-    # FIX: Fetch live individual market pricing directly, bypassing bulk cache zeros
     try:
-        detail = client.get_market(ticker)
-        market_detail = detail.get("market", detail)
-        prices = get_market_prices(market_detail)
-        
+        prices = get_market_prices(market)
         entry_price = prices["yes_ask"] if outcome_to_trade == "YES" else prices["no_ask"]
 
         if entry_price is None or entry_price <= 0 or entry_price >= 100:
