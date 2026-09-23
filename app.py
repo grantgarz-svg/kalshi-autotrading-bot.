@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with precise API v2 orderbook mapping")
 
 
 # ============================================================
@@ -225,8 +225,9 @@ class KalshiClient:
             "ticker": ticker,
             "client_order_id": client_order_id,
             "side": book_side,
-            "count": str(int(contracts)),  # FIXED: Kalshi requires count as string
-            "price": int(D(price_dollars) * 100),
+            "count": str(int(contracts)),
+            # FIXED: Kalshi's backend strict unmarshaling requires price to be a string formatted decimal
+            "price": str(price_dollars),
             "time_in_force": "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
             "reduce_only": bool(reduce_only),
