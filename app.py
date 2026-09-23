@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with advanced risk controls")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with multi-strike liquidity scanning")
 
 
 # ============================================================
@@ -238,7 +238,7 @@ class KalshiClient:
 
 
 # ============================================================
-# MARKET HELPERS & RATE-LIMIT SAFE DISCOVERY
+# MARKET HELPERS & MULTI-STRIKE LIQUIDITY SCANNER
 # ============================================================
 
 def parse_time(value):
@@ -286,7 +286,11 @@ def get_live_ask_price(client, ticker, outcome_to_trade):
         return 0
 
 
-def find_active_market(client, series_ticker, min_expiry_mins=0, outcome_to_trade="YES"):
+def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, outcome_to_trade="YES"):
+    """
+    Scans all open markets, groups them by expiry window, and actively loops 
+    through strikes to return the first ticker that has active liquidity (ask > 0).
+    """
     markets = []
     try:
         res = client.get_markets(series_ticker=series_ticker)
@@ -302,11 +306,11 @@ def find_active_market(client, series_ticker, min_expiry_mins=0, outcome_to_trad
         except Exception:
             pass
 
-    open_markets = [m for m in markets if m.get("status") in (None, "open", "active")]
+    open_markets = [m for m in markets if m.get("status"] in (None, "open", "active")]
     valid_markets = [m for m in open_markets if market_minutes_remaining(m) is not None and market_minutes_remaining(m) > min_expiry_mins]
 
     if not valid_markets:
-        return None
+        return None, 0
 
     windows = {}
     for m in valid_markets:
@@ -322,24 +326,23 @@ def find_active_market(client, series_ticker, min_expiry_mins=0, outcome_to_trad
         current_window = windows[w_key]
         current_window.sort(key=lambda x: x.get("ticker", ""))
         
-        # RATE-LIMIT SAFE CHECK: Inspect middle (ATM) strike first to avoid spamming API orderbooks
-        if current_window:
-            mid_idx = len(current_window) // 2
-            candidate = current_window[mid_idx]
-            ask = get_live_ask_price(client, candidate.get("ticker"), outcome_to_trade)
-            if ask > 0 and ask < 100:
-                return candidate
-            
-            # If ATM doesn't have immediate ask, check remaining strikes in window
-            for m in current_window:
-                t = m.get("ticker")
-                ask = get_live_ask_price(client, t, outcome_to_trade)
-                if ask > 0 and ask < 100:
-                    return m
-                    
-            return candidate
+        # Loop through every strike in the window to find one with an active ask price
+        for m in current_window:
+            t = m.get("ticker")
+            ask = get_live_ask_price(client, t, outcome_to_trade)
+            if 0 < ask < 100:
+                return m, ask
 
-    return None
+    # Fallback to the closest expiration middle strike if absolute liquidity wasn't caught
+    if sorted_windows:
+        fallback_window = windows[sorted_windows[0]]
+        if fallback_window:
+            fallback_market = fallback_window[len(fallback_window) // 2]
+            t = fallback_market.get("ticker")
+            ask = get_live_ask_price(client, t, outcome_to_trade)
+            return fallback_market, ask
+
+    return None, 0
 
 
 def outcome_to_book_side(outcome, action):
@@ -760,26 +763,20 @@ def run_bot_cycle(client, daily_spent):
         return
 
     try:
-        market = find_active_market(client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), outcome_to_trade=outcome_to_trade)
-        if not market:
-            log(f"No liquid open market found for {series_ticker}.")
+        # Scan and find a market that has active liquidity for our outcome
+        market, entry_price = find_active_market_with_liquidity(
+            client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), outcome_to_trade=outcome_to_trade
+        )
+
+        if not market or entry_price <= 0 or entry_price >= 100:
+            # Silent check to prevent log spam when waiting for liquidity
             return
 
         ticker = market.get("ticker")
         st.session_state.active_ticker = ticker
-    except Exception as error:
-        log(f"Market discovery error: {error}")
-        return
-
-    try:
-        entry_price = get_live_ask_price(client, ticker, outcome_to_trade)
-        if entry_price <= 0 or entry_price >= 100:
-            log(f"{ticker}: no {outcome_to_trade} ask available.")
-            return
-
         st.session_state.last_price = entry_price
     except Exception as error:
-        log(f"Price error: {error}")
+        log(f"Market discovery error: {error}")
         return
 
     try:
