@@ -285,31 +285,36 @@ def market_minutes_remaining(market):
     return (close - now_utc()).total_seconds() / 60
 
 
-def get_market_prices(market):
-    yes_bid = market.get("yes_bid")
-    yes_ask = market.get("yes_ask")
-    no_bid = market.get("no_bid")
-    no_ask = market.get("no_ask")
+def get_live_ask_price(client, ticker, outcome_to_trade):
+    """
+    Directly queries Kalshi's orderbook endpoint to fetch real executable ask prices.
+    """
+    try:
+        res = client.get_orderbook(ticker)
+        ob = res.get("orderbook", res)
+        
+        yes_levels = ob.get("yes", []) or ob.get("yes_bids", [])
+        no_levels = ob.get("no", []) or ob.get("no_bids", [])
+        
+        def extract_best(levels):
+            if not levels: return 0
+            lvl = levels[0]
+            if isinstance(lvl, dict): return int(lvl.get("price", 0))
+            if isinstance(lvl, (list, tuple)): return int(lvl[0])
+            return 0
 
-    if yes_ask is None and no_bid is not None:
-        yes_ask = 100 - int(no_bid)
+        yes_bid = extract_best(yes_levels)
+        no_bid = extract_best(no_levels)
+        
+        yes_ask = (100 - no_bid) if no_bid > 0 else 0
+        no_ask = (100 - yes_bid) if yes_bid > 0 else 0
 
-    if no_ask is None and yes_bid is not None:
-        no_ask = 100 - int(yes_bid)
-
-    return {
-        "yes_bid": int(yes_bid) if yes_bid is not None else None,
-        "yes_ask": int(yes_ask) if yes_ask is not None else None,
-        "no_bid": int(no_bid) if no_bid is not None else None,
-        "no_ask": int(no_ask) if no_ask is not None else None,
-    }
+        return yes_ask if outcome_to_trade == "YES" else no_ask
+    except Exception:
+        return 0
 
 
 def find_active_market(client, markets, min_expiry_mins=0, outcome_to_trade="YES"):
-    """
-    Scans open markets, groups them by expiry window, and checks individual 
-    order books to find the first strike with real active liquidity for the desired outcome.
-    """
     open_markets = [m for m in markets if m.get("status") in (None, "open", "active")]
     valid_markets = []
     
@@ -333,31 +338,18 @@ def find_active_market(client, markets, min_expiry_mins=0, outcome_to_trade="YES
     
     for w_key in sorted_windows:
         current_window = windows[w_key]
-        # Sort strikes numerically/alphabetically for consistent scanning order
         current_window.sort(key=lambda x: x.get("ticker", ""))
         
-        # Actively scan strikes in this window for real liquidity
+        # Scan orderbooks directly to find the first strike with an active ask
         for m in current_window:
             t = m.get("ticker")
-            try:
-                detail = client.get_market(t)
-                m_detail = detail.get("market", detail)
-                prices = get_market_prices(m_detail)
-                
-                ask_price = prices["yes_ask"] if outcome_to_trade == "YES" else prices["no_ask"]
-                if ask_price is not None and 0 < ask_price < 100:
-                    return m_detail # Found a liquid strike with a valid ask!
-            except Exception:
-                continue
-                
-        # Fallback to the middle strike of the window if no deep prices caught cleanly
+            ask = get_live_ask_price(client, t, outcome_to_trade)
+            if ask > 0 and ask < 100:
+                return m
+
+        # Fallback to middle strike if no direct orderbook matches found instantly
         if current_window:
-            try:
-                t = current_window[len(current_window) // 2].get("ticker")
-                det = client.get_market(t)
-                return det.get("market", det)
-            except Exception:
-                return current_window[0]
+            return current_window[len(current_window) // 2]
 
     return None
 
@@ -631,12 +623,23 @@ def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pc
         return False
 
     try:
-        det = client.get_market(ticker)
-        m_detail = det.get("market", det)
-        prices = get_market_prices(m_detail)
-        current_bid = prices["yes_bid"] if outcome == "YES" else prices["no_bid"]
+        res = client.get_orderbook(ticker)
+        ob = res.get("orderbook", res)
+        yes_levels = ob.get("yes", []) or ob.get("yes_bids", [])
+        no_levels = ob.get("no", []) or ob.get("no_bids", [])
         
-        if current_bid is None or current_bid <= 0:
+        def extract_best(levels):
+            if not levels: return 0
+            lvl = levels[0]
+            if isinstance(lvl, dict): return int(lvl.get("price", 0))
+            if isinstance(lvl, (list, tuple)): return int(lvl[0])
+            return 0
+            
+        yes_bid = extract_best(yes_levels)
+        no_bid = extract_best(no_levels)
+        current_bid = yes_bid if outcome == "YES" else no_bid
+        
+        if current_bid <= 0:
             return False
             
     except Exception as error:
@@ -801,7 +804,6 @@ def run_bot_cycle(client, daily_spent):
 
     try:
         markets_response = client.get_markets(series_ticker)
-        # Pass outcome_to_trade so the scanner specifically targets strikes with active quotes for our side
         market = find_active_market(client, markets_response.get("markets", []), min_expiry_mins=float(min_minutes_to_expiry), outcome_to_trade=outcome_to_trade)
 
         if not market:
@@ -815,10 +817,9 @@ def run_bot_cycle(client, daily_spent):
         return
 
     try:
-        prices = get_market_prices(market)
-        entry_price = prices["yes_ask"] if outcome_to_trade == "YES" else prices["no_ask"]
+        entry_price = get_live_ask_price(client, ticker, outcome_to_trade)
 
-        if entry_price is None or entry_price <= 0 or entry_price >= 100:
+        if entry_price <= 0 or entry_price >= 100:
             log(f"{ticker}: no {outcome_to_trade} ask available.")
             return
 
