@@ -368,18 +368,21 @@ def find_active_market(markets):
     ]
 
     # 3. Sort strikes to find the At-The-Money (ATM) contract closest to 50 cents
-    def atm_distance(m):
+    def atm_score(m):
         bid = m.get("yes_bid")
         ask = m.get("yes_ask")
-        if bid is not None and ask is not None:
-            return abs(((bid + ask) / 2) - 50)
-        if bid is not None:
-            return abs(bid - 50)
-        if ask is not None:
-            return abs(ask - 50)
-        return 999  # Penalty for empty order books
+        
+        # Penalize empty or uncompetitive order books heavily
+        if bid is None or ask is None or bid == 0 or ask >= 100:
+            return 9999
+            
+        midpoint = (bid + ask) / 2
+        spread = ask - bid
+        
+        # Add spread width to the distance from 50 to penalize illiquid 0/100 books
+        return abs(midpoint - 50) + spread
 
-    current_window.sort(key=atm_distance)
+    current_window.sort(key=atm_score)
 
     # Return the most liquid strike for the current window
     return current_window[0]
