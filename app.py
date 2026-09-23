@@ -285,6 +285,26 @@ def market_minutes_remaining(market):
     return (close - now_utc()).total_seconds() / 60
 
 
+def get_market_prices(market):
+    yes_bid = market.get("yes_bid")
+    yes_ask = market.get("yes_ask")
+    no_bid = market.get("no_bid")
+    no_ask = market.get("no_ask")
+
+    if yes_ask is None and no_bid is not None:
+        yes_ask = 100 - int(no_bid)
+
+    if no_ask is None and yes_bid is not None:
+        no_ask = 100 - int(yes_bid)
+
+    return {
+        "yes_bid": int(yes_bid) if yes_bid is not None else None,
+        "yes_ask": int(yes_ask) if yes_ask is not None else None,
+        "no_bid": int(no_bid) if no_bid is not None else None,
+        "no_ask": int(no_ask) if no_ask is not None else None,
+    }
+
+
 def find_active_market(markets):
     open_markets = [m for m in markets if m.get("status") in (None, "open", "active")]
     valid_markets = []
@@ -302,11 +322,14 @@ def find_active_market(markets):
     current_window = [m for m in valid_markets if abs(market_minutes_remaining(m) - target_mins) < 1.0]
 
     def atm_score(m):
-        bid = m.get("yes_bid")
-        ask = m.get("yes_ask")
-        # Strict liquidity check: must have valid ints > 0
+        prices = get_market_prices(m)
+        bid = prices.get("yes_bid")
+        ask = prices.get("yes_ask")
+        
+        # If API caches these as 0, score them as 9999 so we know it's unpriced in bulk
         if bid is None or ask is None or bid <= 0 or ask <= 0 or ask >= 100:
             return 9999
+            
         midpoint = (bid + ask) / 2
         spread = ask - bid
         return abs(midpoint - 50) + spread
@@ -314,9 +337,12 @@ def find_active_market(markets):
     current_window.sort(key=atm_score)
     
     best_market = current_window[0]
-    # If the score is 9999, none of the contracts have liquidity.
+    
+    # If all bulk items returned 0 liquidity (9999), fall back to median strike selection
     if atm_score(best_market) == 9999:
-        return None
+        current_window.sort(key=lambda m: m.get("ticker", ""))
+        mid_index = len(current_window) // 2
+        return current_window[mid_index]
 
     return best_market
 
@@ -590,7 +616,6 @@ def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pc
         return False
 
     try:
-        # Fetch live orderbook instead of relying on the stale market object
         ob_response = client.get_orderbook(ticker)
         ob = ob_response.get("orderbook", {})
         bids = ob.get("bids", [])
@@ -786,7 +811,6 @@ def run_bot_cycle(client, daily_spent):
         return
 
     try:
-        # Fetch the live orderbook explicitly rather than trusting static market endpoints
         ob_response = client.get_orderbook(ticker)
         ob = ob_response.get("orderbook", {})
         bids = ob.get("bids", [])
@@ -795,7 +819,6 @@ def run_bot_cycle(client, daily_spent):
         yes_bid = bids[0][0] if bids else 0
         yes_ask = asks[0][0] if asks else 0
         
-        # Calculate NO prices from YES book (Kalshi V2 single book math)
         no_bid = (100 - yes_ask) if yes_ask > 0 else 0
         no_ask = (100 - yes_bid) if yes_bid > 0 else 0
 
