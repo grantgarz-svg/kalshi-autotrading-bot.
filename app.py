@@ -357,10 +357,32 @@ def find_active_market(markets):
     if not valid_markets:
         return None
 
-    # Sort by the closest closing time, ensuring we get the current 15-minute window
+    # 1. Sort by the closest closing time to get the current 15-minute window
     valid_markets.sort(key=lambda m: market_minutes_remaining(m))
+    target_mins = market_minutes_remaining(valid_markets[0])
 
-    return valid_markets[0]
+    # 2. Isolate all strike prices that expire in this exact same window
+    current_window = [
+        m for m in valid_markets
+        if abs(market_minutes_remaining(m) - target_mins) < 1.0
+    ]
+
+    # 3. Sort strikes to find the At-The-Money (ATM) contract closest to 50 cents
+    def atm_distance(m):
+        bid = m.get("yes_bid")
+        ask = m.get("yes_ask")
+        if bid is not None and ask is not None:
+            return abs(((bid + ask) / 2) - 50)
+        if bid is not None:
+            return abs(bid - 50)
+        if ask is not None:
+            return abs(ask - 50)
+        return 999  # Penalty for empty order books
+
+    current_window.sort(key=atm_distance)
+
+    # Return the most liquid strike for the current window
+    return current_window[0]
 
 
 def parse_time(value):
