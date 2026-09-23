@@ -6,6 +6,7 @@ import uuid
 import base64
 import json
 import csv
+import re
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse
 from pathlib import Path
@@ -38,6 +39,11 @@ DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
 LOG_FILE = Path("kalshi_orders.csv")
 
 ZERO = Decimal("0")
+
+MONTH_MAP = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
 
 
 # ============================================================
@@ -338,54 +344,37 @@ class KalshiClient:
 
 
 # ============================================================
-# MARKET HELPERS
+# MARKET HELPERS & TICKER EXPIRATION PARSER
 # ============================================================
 
-def find_active_market(markets):
-    open_markets = [
-        m for m in markets
-        if m.get("status") in (None, "open", "active")
-    ]
-
-    valid_markets = []
-    for m in open_markets:
-        mins = market_minutes_remaining(m)
-        # Filter out markets whose trading window has already passed
-        if mins is not None and mins > 0:
-            valid_markets.append(m)
-
-    if not valid_markets:
+def parse_ticker_expiry(ticker):
+    """
+    Directly extracts expiry from tickers like 'KXBTC15M-26SEP222315-15'
+    Pattern: YY + MMM + DD + HHMM (e.g., 26SEP222315 -> 2026-09-22 23:15 UTC)
+    """
+    if not ticker:
         return None
 
-    # 1. Sort by the closest closing time to get the current 15-minute window
-    valid_markets.sort(key=lambda m: market_minutes_remaining(m))
-    target_mins = market_minutes_remaining(valid_markets[0])
-
-    # 2. Isolate all strike prices that expire in this exact same window
-    current_window = [
-        m for m in valid_markets
-        if abs(market_minutes_remaining(m) - target_mins) < 1.0
-    ]
-
-    # 3. Sort strikes to find the At-The-Money (ATM) contract closest to 50 cents
-    def atm_score(m):
-        bid = m.get("yes_bid")
-        ask = m.get("yes_ask")
-        
-        # Penalize empty or uncompetitive order books heavily
-        if bid is None or ask is None or bid == 0 or ask >= 100:
-            return 9999
-            
-        midpoint = (bid + ask) / 2
-        spread = ask - bid
-        
-        # Add spread width to the distance from 50 to penalize illiquid 0/100 books
-        return abs(midpoint - 50) + spread
-
-    current_window.sort(key=atm_score)
-
-    # Return the most liquid strike for the current window
-    return current_window[0]
+    parts = str(ticker).split("-")
+    if len(parts) >= 2:
+        date_str = parts[1].upper()
+        match = re.match(r"^(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})$", date_str)
+        if match:
+            yy, mmm, dd, hh, mm = match.groups()
+            month = MONTH_MAP.get(mmm)
+            if month:
+                try:
+                    return dt.datetime(
+                        year=2000 + int(yy),
+                        month=month,
+                        day=int(dd),
+                        hour=int(hh),
+                        minute=int(mm),
+                        tzinfo=dt.timezone.utc,
+                    )
+                except Exception:
+                    pass
+    return None
 
 
 def parse_time(value):
@@ -409,10 +398,16 @@ def parse_time(value):
 
 
 def market_minutes_remaining(market):
-    close = (
-        parse_time(market.get("close_time"))
-        or parse_time(market.get("expiration_time"))
-    )
+    ticker = market.get("ticker", "")
+    # Primary: Parse the exact target time directly from the contract ticker
+    close = parse_ticker_expiry(ticker)
+
+    # Fallback: Use payload expiration timestamps if ticker format fails
+    if close is None:
+        close = (
+            parse_time(market.get("close_time"))
+            or parse_time(market.get("expiration_time"))
+        )
 
     if close is None:
         return None
@@ -420,14 +415,51 @@ def market_minutes_remaining(market):
     return (close - now_utc()).total_seconds() / 60
 
 
+def find_active_market(markets):
+    open_markets = [
+        m for m in markets
+        if m.get("status") in (None, "open", "active")
+    ]
+
+    valid_markets = []
+    for m in open_markets:
+        mins = market_minutes_remaining(m)
+        # Drop contracts whose trading window has already passed
+        if mins is not None and mins > 0:
+            valid_markets.append(m)
+
+    if not valid_markets:
+        return None
+
+    # 1. Sort by closest closing time to get the active 15-minute window
+    valid_markets.sort(key=lambda m: market_minutes_remaining(m))
+    target_mins = market_minutes_remaining(valid_markets[0])
+
+    # 2. Isolate all strikes for this specific window
+    current_window = [
+        m for m in valid_markets
+        if abs(market_minutes_remaining(m) - target_mins) < 1.0
+    ]
+
+    # 3. Target the At-The-Money (ATM) strike with tight spreads and active liquidity
+    def atm_score(m):
+        bid = m.get("yes_bid")
+        ask = m.get("yes_ask")
+
+        # Heavily penalize empty order books
+        if bid is None or ask is None or bid == 0 or ask >= 100:
+            return 9999
+
+        midpoint = (bid + ask) / 2
+        spread = ask - bid
+        return abs(midpoint - 50) + spread
+
+    current_window.sort(key=atm_score)
+
+    return current_window[0]
+
+
 def get_market_prices(market):
-    """
-    Returns YES bid/ask and NO bid/ask in cents.
-
-    Newer market payloads can expose yes_bid/yes_ask/no_bid/no_ask.
-    If asks are absent, derive them from the opposite bid.
-    """
-
     yes_bid = market.get("yes_bid")
     yes_ask = market.get("yes_ask")
     no_bid = market.get("no_bid")
@@ -453,15 +485,9 @@ def get_market_prices(market):
 
 def outcome_to_book_side(outcome, action):
     """
-    V2 has a single YES book.
-
-    YES:
-      buy  -> bid
-      sell -> ask
-
-    NO:
-      buy  -> ask
-      sell -> bid
+    V2 single-book architecture:
+    YES: buy -> bid, sell -> ask
+    NO:  buy -> ask, sell -> bid
     """
     if outcome == "YES":
         return "bid" if action == "BUY" else "ask"
@@ -470,13 +496,6 @@ def outcome_to_book_side(outcome, action):
 
 
 def outcome_price_to_book_price(outcome, action, outcome_cents):
-    """
-    Converts the desired YES/NO contract price to the V2
-    single-book price.
-
-    YES price is the V2 book price.
-    NO price is the complement of the V2 YES price.
-    """
     p = D(outcome_cents) / D(100)
 
     if outcome == "YES":
@@ -550,8 +569,6 @@ def fill_outcome(fill):
     if outcome:
         return str(outcome).upper()
 
-    # V2 book side fallback:
-    # bid = YES side, ask = NO side only when interpreted
     book_side = str(fill.get("book_side", "")).lower()
 
     if book_side == "bid":
@@ -586,7 +603,6 @@ def fill_price(fill, outcome):
 
     value = D(raw)
 
-    # Legacy integer cents fallback.
     if value > 1:
         value = value / D(100)
 
@@ -605,11 +621,6 @@ def fill_count(fill):
 
 
 def reconstruct_average_entry(fills, ticker, outcome):
-    """
-    Reconstructs the open position cost using FIFO-style lots
-    from fills returned by Kalshi.
-    """
-
     relevant = []
 
     for fill in fills:
@@ -654,7 +665,6 @@ def reconstruct_average_entry(fills, ticker, outcome):
             lots.append([qty, price])
             continue
 
-        # SELL consumes existing lots.
         remaining = qty
 
         while remaining > 0 and lots:
@@ -697,13 +707,6 @@ def utc_day_start_timestamp():
 
 
 def calculate_daily_spend(client):
-    """
-    Uses actual fills instead of Streamlit session state.
-
-    This means restarting the app does not reset the daily
-    spending calculation.
-    """
-
     fills_response = client.get_fills(
         min_ts=utc_day_start_timestamp()
     )
@@ -723,7 +726,6 @@ def calculate_daily_spend(client):
 
         qty = fill_count(fill)
         price = fill_price(fill, outcome)
-
         fee = D(fill.get("fee_cost"))
 
         total += qty * price
@@ -784,11 +786,9 @@ def submit_trade(
 
     client_order_id = make_client_order_id()
 
-    st.session_state.last_client_order_id = (
-        client_order_id
-    )
+    st.session_state.last_client_order_id = client_order_id
 
-    # Paper mode.
+    # Paper mode
     if mode == "PAPER TRADING":
         log(
             f"📝 PAPER {action} {contracts} {outcome} "
@@ -831,7 +831,7 @@ def submit_trade(
             "status": "paper_fill",
         }
 
-    # Live order.
+    # Live order
     try:
         response = client.create_v2_order(
             ticker=ticker,
@@ -913,10 +913,7 @@ def submit_trade(
             "error": str(error),
         })
 
-        log(
-            f"❌ LIVE ORDER FAILED: {error}"
-        )
-
+        log(f"❌ LIVE ORDER FAILED: {error}")
         raise
 
 
@@ -1134,8 +1131,8 @@ with st.sidebar:
         "Entry outcome",
         ["UP", "DOWN"],
     )
-    
-    # Map the UI choice back to the API's backend format
+
+    # Map UI display to single-book backend format
     outcome_to_trade = "YES" if display_outcome == "UP" else "NO"
 
     st.divider()
@@ -1321,9 +1318,7 @@ with c1:
             )
 
         elif trading_mode == "LIVE TRADING" and not live_confirmed:
-            st.error(
-                "Live confirmation is required."
-            )
+            st.error("Live confirmation is required.")
 
         else:
             st.session_state.running = True
@@ -1392,7 +1387,7 @@ if st.session_state.running:
         st.stop()
 
     # --------------------------------------------------------
-    # Live mode must never use Demo API.
+    # Live mode must never use Demo API
     # --------------------------------------------------------
 
     if trading_mode == "LIVE TRADING" and demo_mode:
@@ -1409,9 +1404,7 @@ if st.session_state.running:
 
     current_time = dt.datetime.now().time()
 
-    if not (
-        start_time <= current_time <= end_time
-    ):
+    if not (start_time <= current_time <= end_time):
         log("Outside trading hours.")
         time.sleep(5)
         st.rerun()
@@ -1426,10 +1419,7 @@ if st.session_state.running:
             if trading_mode == "LIVE TRADING"
             else sum(
                 (
-                    D(
-                        str(row["Cost"])
-                        .replace("$", "")
-                    )
+                    D(str(row["Cost"]).replace("$", ""))
                     for row in st.session_state.paper_trades
                 ),
                 ZERO,
@@ -1447,9 +1437,7 @@ if st.session_state.running:
 
     if daily_spent >= D(daily_cap):
         st.error("Daily spending cap reached.")
-        log(
-            f"Daily cap reached: ${daily_spent:.2f}"
-        )
+        log(f"Daily cap reached: ${daily_spent:.2f}")
         st.session_state.running = False
         st.stop()
 
@@ -1458,18 +1446,14 @@ if st.session_state.running:
     # --------------------------------------------------------
 
     try:
-        markets_response = client.get_markets(
-            series_ticker
-        )
+        markets_response = client.get_markets(series_ticker)
 
         market = find_active_market(
             markets_response.get("markets", [])
         )
 
         if not market:
-            log(
-                f"No open market for {series_ticker}."
-            )
+            log(f"No open market for {series_ticker}.")
             time.sleep(5)
             st.rerun()
 
@@ -1501,7 +1485,6 @@ if st.session_state.running:
             f"{ticker}: entry blocked because "
             f"only {minutes_left:.2f} minutes remain."
         )
-
         time.sleep(5)
         st.rerun()
 
@@ -1519,8 +1502,6 @@ if st.session_state.running:
         )
 
         if entry_price is None:
-            # Refresh the individual market if the list payload
-            # did not include complete quote fields.
             detail = client.get_market(ticker)
             prices = get_market_prices(
                 detail.get("market", detail)
@@ -1533,9 +1514,7 @@ if st.session_state.running:
             )
 
         if entry_price is None:
-            log(
-                f"{ticker}: no {outcome_to_trade} ask."
-            )
+            log(f"{ticker}: no {outcome_to_trade} ask.")
             time.sleep(3)
             st.rerun()
 
@@ -1551,14 +1530,8 @@ if st.session_state.running:
     # --------------------------------------------------------
 
     try:
-        position_response = client.get_positions(
-            ticker=ticker
-        )
-
-        position = extract_position(
-            position_response,
-            ticker,
-        )
+        position_response = client.get_positions(ticker=ticker)
+        position = extract_position(position_response, ticker)
 
         if position["contracts"] > 0:
             log(
@@ -1567,10 +1540,7 @@ if st.session_state.running:
                 f"{position['outcome']}"
             )
 
-        fills_response = client.get_fills(
-            ticker=ticker
-        )
-
+        fills_response = client.get_fills(ticker=ticker)
         fills = fills_response.get("fills", [])
 
     except Exception as error:
@@ -1623,7 +1593,6 @@ if st.session_state.running:
             f"{position['contracts']:.2f} {outcome_to_trade} "
             f"in {ticker}."
         )
-
         time.sleep(3)
         st.rerun()
 
@@ -1631,14 +1600,11 @@ if st.session_state.running:
     # Cooldown
     # --------------------------------------------------------
 
-    signal = (
-        entry_price <= max_entry
-    )
+    signal = entry_price <= max_entry
 
     if signal and st.session_state.last_trade_time:
         elapsed = (
-            now_utc()
-            - st.session_state.last_trade_time
+            now_utc() - st.session_state.last_trade_time
         ).total_seconds()
 
         if elapsed < cooldown:
@@ -1649,10 +1615,7 @@ if st.session_state.running:
     # --------------------------------------------------------
 
     if signal:
-
-        remaining_daily = (
-            D(daily_cap) - daily_spent
-        )
+        remaining_daily = D(daily_cap) - daily_spent
 
         contracts = calculate_contracts(
             max_dollars=D(max_dollars_trade),
@@ -1668,9 +1631,7 @@ if st.session_state.running:
 
         else:
             estimated_cost = (
-                D(contracts)
-                * D(entry_price)
-                / D(100)
+                D(contracts) * D(entry_price) / D(100)
             )
 
             log(
@@ -1695,16 +1656,12 @@ if st.session_state.running:
                 st.session_state.last_trade_time = now_utc()
 
                 if trading_mode == "LIVE TRADING":
-                    filled, remaining, status = (
-                        confirm_fill(
-                            client,
-                            result.get("order_id"),
-                        )
+                    filled, remaining, status = confirm_fill(
+                        client,
+                        result.get("order_id"),
                     )
 
-                    st.session_state.last_fill_count = (
-                        filled
-                    )
+                    st.session_state.last_fill_count = filled
 
                     log(
                         f"FILL CONFIRMATION: "
@@ -1714,23 +1671,18 @@ if st.session_state.running:
                     )
 
                     if filled > 0:
-                        st.session_state.bot_positions[
-                            ticker
-                        ] = {
+                        st.session_state.bot_positions[ticker] = {
                             "outcome": outcome_to_trade,
                             "contracts": str(filled),
                         }
 
                 else:
-                    st.session_state.bot_positions[
-                        ticker
-                    ] = {
+                    st.session_state.bot_positions[ticker] = {
                         "outcome": outcome_to_trade,
                         "contracts": str(contracts),
                     }
 
             except Exception:
-                # submit_trade already logs the full error.
                 pass
 
     else:
@@ -1747,11 +1699,7 @@ if st.session_state.running:
     st.subheader("📜 Bot Log")
 
     if st.session_state.logs:
-        st.code(
-            "\n".join(
-                st.session_state.logs[-30:]
-            )
-        )
+        st.code("\n".join(st.session_state.logs[-30:]))
     else:
         st.info("Waiting for bot activity...")
 
@@ -1782,17 +1730,12 @@ if st.session_state.running:
 
 else:
     st.info(
-        "Bot is stopped. Choose your settings and press "
-        "'START AUTOTRADING'."
+        "Bot is stopped. Choose your settings and press 'START AUTOTRADING'."
     )
 
     if st.session_state.logs:
         st.subheader("📜 Bot Log")
-        st.code(
-            "\n".join(
-                st.session_state.logs[-30:]
-            )
-        )
+        st.code("\n".join(st.session_state.logs[-30:]))
 
     if st.session_state.paper_trades:
         st.subheader("📝 Paper Trades")
