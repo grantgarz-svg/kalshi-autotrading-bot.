@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with precise API v2 orderbook mapping")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with live PnL tracking")
 
 
 # ============================================================
@@ -54,6 +54,8 @@ DEFAULTS = {
     "emergency_stop": False,
     "logs": [],
     "paper_trades": [],
+    "paper_positions": {},      # Tracks active paper positions: ticker -> {contracts, avg_cost, outcome}
+    "paper_realized_pnl": ZERO, # Total locked-in paper profit/loss
     "last_trade_time": None,
     "last_price": None,
     "active_ticker": None,
@@ -221,7 +223,6 @@ class KalshiClient:
         return self.request("GET", f"/portfolio/orders/{order_id}")
 
     def create_v2_order(self, ticker, client_order_id, book_side, contracts, price_dollars, reduce_only=False):
-        # FIXED: Format price strictly to 4 decimal places (e.g. 0.6 -> 0.6000) to satisfy API V2 Precision Requirements
         formatted_price = f"{float(price_dollars):.4f}"
         body = {
             "ticker": ticker,
@@ -263,29 +264,18 @@ def market_minutes_remaining(market):
 
 
 def get_live_ask_price(client, ticker, outcome_to_trade):
-    """
-    Directly queries Kalshi's orderbook endpoint, correctly unwrapping the orderbook_fp object
-    and pulling the LAST element (which represents the top of the book / highest bid).
-    """
+    """Gets the best ASK price (what you pay to enter/BUY)"""
     try:
         res = client.get_orderbook(ticker)
-        
         ob = res.get("orderbook_fp") or res.get("orderbook") or res
-        
         yes_levels = ob.get("yes_dollars") or ob.get("yes") or []
         no_levels = ob.get("no_dollars") or ob.get("no") or []
         
         def extract_best(levels):
             if not levels: return 0
-            
             lvl = levels[-1] 
-            
-            if isinstance(lvl, (list, tuple)): 
-                return int(float(lvl[0]) * 100) 
-            
-            if isinstance(lvl, dict): 
-                return int(float(lvl.get("price", 0)) * 100)
-                
+            if isinstance(lvl, (list, tuple)): return int(float(lvl[0]) * 100) 
+            if isinstance(lvl, dict): return int(float(lvl.get("price", 0)) * 100)
             return 0
 
         yes_bid = extract_best(yes_levels)
@@ -295,9 +285,30 @@ def get_live_ask_price(client, ticker, outcome_to_trade):
         no_ask = (100 - yes_bid) if yes_bid > 0 else 0
 
         return yes_ask if outcome_to_trade == "YES" else no_ask
-        
     except Exception as e:
-        log(f"Orderbook parse error for {ticker}: {str(e)}")
+        return 0
+
+
+def get_live_bid_price(client, ticker, outcome_to_trade):
+    """Gets the best BID price (what you receive when you exit/SELL for TP/SL)"""
+    try:
+        res = client.get_orderbook(ticker)
+        ob = res.get("orderbook_fp") or res.get("orderbook") or res
+        yes_levels = ob.get("yes_dollars") or ob.get("yes") or []
+        no_levels = ob.get("no_dollars") or ob.get("no") or []
+        
+        def extract_best(levels):
+            if not levels: return 0
+            lvl = levels[-1] 
+            if isinstance(lvl, (list, tuple)): return int(float(lvl[0]) * 100) 
+            if isinstance(lvl, dict): return int(float(lvl.get("price", 0)) * 100)
+            return 0
+
+        yes_bid = extract_best(yes_levels)
+        no_bid = extract_best(no_levels)
+
+        return yes_bid if outcome_to_trade == "YES" else no_bid
+    except Exception as e:
         return 0
 
 
@@ -505,7 +516,34 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
     
     st.session_state.last_client_order_id = client_order_id
 
+    # ==========================================
+    # PAPER TRADING LEDGER & PNL CALCULATIONS
+    # ==========================================
     if mode == "PAPER TRADING":
+        contracts_d = D(contracts)
+        price_d = D(outcome_cents) / D(100)
+        
+        # Initialize ticker in paper ledger if it doesn't exist
+        if ticker not in st.session_state.paper_positions:
+            st.session_state.paper_positions[ticker] = {"contracts": ZERO, "avg_cost": ZERO, "outcome": outcome}
+            
+        pos = st.session_state.paper_positions[ticker]
+
+        if action == "BUY":
+            total_current_cost = pos["contracts"] * pos["avg_cost"]
+            new_cost = contracts_d * price_d
+            pos["contracts"] += contracts_d
+            pos["avg_cost"] = (total_current_cost + new_cost) / pos["contracts"]
+        elif action == "SELL":
+            realized_profit = (price_d - pos["avg_cost"]) * contracts_d
+            st.session_state.paper_realized_pnl += realized_profit
+            pos["contracts"] -= contracts_d
+            if pos["contracts"] <= 0:
+                pos["contracts"] = ZERO
+                pos["avg_cost"] = ZERO
+
+        st.session_state.paper_positions[ticker] = pos
+
         log(f"📝 PAPER {action} {contracts} {outcome} {ticker} @ {outcome_cents}¢")
         st.session_state.paper_trades.append({
             "Time": now_utc().strftime("%H:%M:%S"),
@@ -514,21 +552,16 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
             "Action": action,
             "Contracts": contracts,
             "Price": f"{outcome_cents}¢",
-            "Cost": f"${estimated_cost:.2f}",
-        })
-        append_order_log({
-            "timestamp": now_utc().isoformat(), "mode": mode, "ticker": ticker,
-            "outcome": outcome, "action": action, "book_side": book_side,
-            "contracts": contracts, "price": f"{D(outcome_cents)/D(100):.4f}",
-            "estimated_cost": f"{estimated_cost:.4f}", "order_id": "PAPER",
-            "client_order_id": client_order_id, "fill_count": contracts,
-            "remaining_count": 0, "status": "paper_fill", "error": "",
+            "Cost/Value": f"${estimated_cost:.2f}",
         })
         return {
             "order_id": "PAPER", "client_order_id": client_order_id,
             "fill_count": D(contracts), "remaining_count": ZERO, "status": "paper_fill",
         }
 
+    # ==========================================
+    # LIVE TRADING EXECUTION
+    # ==========================================
     try:
         response = client.create_v2_order(
             ticker=ticker, client_order_id=client_order_id, book_side=book_side,
@@ -597,8 +630,8 @@ def confirm_fill(client, order_id, timeout_seconds=4):
     return ZERO, ZERO, "unknown"
 
 
-def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pct):
-    if position["contracts"] <= 0:
+def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_loss_pct):
+    if position["contracts"] <= 0 or avg_entry is None:
         return False
 
     ticker = position["ticker"]
@@ -608,35 +641,15 @@ def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pc
         return False
 
     try:
-        res = client.get_orderbook(ticker)
-        ob = res.get("orderbook_fp") or res.get("orderbook") or res
-        yes_levels = ob.get("yes_dollars") or ob.get("yes") or []
-        no_levels = ob.get("no_dollars") or ob.get("no") or []
-        
-        def extract_best(levels):
-            if not levels: return 0
-            lvl = levels[-1]
-            if isinstance(lvl, (list, tuple)): return int(float(lvl[0]) * 100)
-            if isinstance(lvl, dict): return int(float(lvl.get("price", 0)) * 100)
-            return 0
-            
-        yes_bid = extract_best(yes_levels)
-        no_bid = extract_best(no_levels)
-        current_bid = yes_bid if outcome == "YES" else no_bid
-        
+        current_bid = get_live_bid_price(client, ticker, outcome)
         if current_bid <= 0:
             return False
     except Exception as error:
-        log(f"TP/SL price fetch error: {error}")
-        return False
-
-    entry = reconstruct_average_entry(fills, ticker, outcome)
-    if entry is None:
         return False
 
     current = D(current_bid) / D(100)
-    tp_price = entry * (D(1) + D(take_profit_pct) / D(100))
-    sl_price = entry * (D(1) - D(stop_loss_pct) / D(100))
+    tp_price = avg_entry * (D(1) + D(take_profit_pct) / D(100))
+    sl_price = avg_entry * (D(1) - D(stop_loss_pct) / D(100))
 
     reason = None
     if take_profit_pct > 0 and current >= tp_price:
@@ -647,7 +660,7 @@ def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pc
     if reason is None:
         return False
 
-    log(f"🚨 {reason}: {ticker} {outcome} entry=${entry:.4f}, bid=${current:.4f}")
+    log(f"🚨 {mode} {reason}: {ticker} {outcome} entry=${avg_entry:.4f}, bid=${current:.4f}")
     result = submit_trade(
         client=client, mode=mode, ticker=ticker, outcome=outcome,
         action="SELL", contracts=contracts, outcome_cents=current_bid, reduce_only=True,
@@ -774,7 +787,6 @@ def run_bot_cycle(client, daily_spent):
 
     if daily_spent >= D(daily_cap):
         st.error("Daily spending cap reached.")
-        log(f"Daily cap reached: ${daily_spent:.2f}")
         st.session_state.running = False
         st.rerun()
         return
@@ -794,18 +806,34 @@ def run_bot_cycle(client, daily_spent):
         log(f"Market discovery error: {error}")
         return
 
-    try:
-        position_response = client.get_positions(ticker=ticker)
-        position = extract_position(position_response, ticker)
-        fills_response = client.get_fills(ticker=ticker)
-        fills = fills_response.get("fills", [])
-    except Exception as error:
-        log(f"Position/fill error: {error}")
-        return
+    # ==========================================
+    # POSITIONS ROUTING (LIVE vs PAPER)
+    # ==========================================
+    position = {"contracts": ZERO}
+    avg_entry = None
 
+    if trading_mode == "LIVE TRADING":
+        try:
+            position_response = client.get_positions(ticker=ticker)
+            position = extract_position(position_response, ticker)
+            fills_response = client.get_fills(ticker=ticker)
+            fills = fills_response.get("fills", [])
+            avg_entry = reconstruct_average_entry(fills, ticker, outcome_to_trade)
+        except Exception as error:
+            log(f"Position/fill error: {error}")
+            return
+    else:
+        # Paper Routing
+        p_pos = st.session_state.paper_positions.get(ticker, {"contracts": ZERO, "avg_cost": ZERO, "outcome": outcome_to_trade})
+        position = {"ticker": ticker, "outcome": outcome_to_trade, "contracts": p_pos["contracts"]}
+        avg_entry = p_pos["avg_cost"] if p_pos["contracts"] > 0 else None
+
+    # ==========================================
+    # TP / SL MANAGEMENT
+    # ==========================================
     if position["contracts"] > 0 and (manage_existing or ticker in st.session_state.bot_positions):
         try:
-            exited = manage_position(client, trading_mode, position, fills, take_profit_pct, stop_loss_pct)
+            exited = manage_position(client, trading_mode, position, avg_entry, take_profit_pct, stop_loss_pct)
             if exited:
                 st.session_state.last_trade_time = now_utc()
                 return
@@ -819,10 +847,14 @@ def run_bot_cycle(client, daily_spent):
                 st.rerun()
                 return
 
+    # Duplicate protection check (ensures we don't spam buys if we already hold contracts)
     already_in_target_position = (position["contracts"] > 0 and position["outcome"] == outcome_to_trade)
     if already_in_target_position:
         return
 
+    # ==========================================
+    # ENTRY LOGIC
+    # ==========================================
     signal = entry_price <= max_entry
     if signal and st.session_state.last_trade_time:
         elapsed = (now_utc() - st.session_state.last_trade_time).total_seconds()
@@ -849,7 +881,6 @@ def run_bot_cycle(client, daily_spent):
                 if trading_mode == "LIVE TRADING":
                     filled, remaining, status = confirm_fill(client, result.get("order_id"))
                     st.session_state.last_fill_count = filled
-                    log(f"FILL CONFIRMATION: filled={filled}, remaining={remaining}, status={status}")
                     if filled > 0:
                         st.session_state.bot_positions[ticker] = {"outcome": outcome_to_trade, "contracts": str(filled)}
                 else:
@@ -882,31 +913,79 @@ def render_dashboard_and_tick():
                 st.session_state.running = False
                 st.rerun()
 
+    # Calculate Daily Spent based on Mode
     if client and trading_mode == "LIVE TRADING":
         try:
             daily_spent = calculate_daily_spend(client)
         except Exception:
             pass
     elif trading_mode == "PAPER TRADING":
-        daily_spent = sum((D(str(row["Cost"]).replace("$", "")) for row in st.session_state.paper_trades), ZERO)
+        # Sum paper buy costs
+        daily_spent = sum((D(str(row["Cost/Value"]).replace("$", "")) for row in st.session_state.paper_trades if row["Action"] == "BUY"), ZERO)
 
-    c_dash1, c_dash2, c_dash3, c_dash4, c_dash5 = st.columns(5)
+    # Calculate Dynamic Paper Unrealized PnL
+    paper_unrealized = ZERO
+    if client and trading_mode == "PAPER TRADING":
+        for t, p_data in st.session_state.paper_positions.items():
+            if p_data["contracts"] > 0:
+                current_bid_cents = get_live_bid_price(client, t, p_data["outcome"])
+                if current_bid_cents > 0:
+                    current_val = D(current_bid_cents) / D(100)
+                    paper_unrealized += (current_val - p_data["avg_cost"]) * p_data["contracts"]
+
+    # Dashboard Metrics Render
+    c_dash1, c_dash2, c_dash3, c_dash4, c_dash5, c_dash6 = st.columns(6)
     with c_dash1:
         st.metric("Mode", trading_mode)
     with c_dash2:
         st.metric("Daily Spent", f"${daily_spent:.2f}")
-    with c_dash3:
-        st.metric("Market", st.session_state.active_ticker or "--")
-    with c_dash4:
-        price_display = f"{st.session_state.last_price}¢" if st.session_state.last_price else "--"
-        st.metric("Entry Price", price_display)
-    with c_dash5:
-        st.metric("Last Fill", f"{st.session_state.last_fill_count:.2f}")
 
+    if trading_mode == "PAPER TRADING":
+        with c_dash3:
+            st.metric("Paper Realized P/L", f"${st.session_state.paper_realized_pnl:.2f}")
+        with c_dash4:
+            # Color format based on profit/loss
+            color = "normal" if paper_unrealized == 0 else ("inverse" if paper_unrealized < 0 else "normal")
+            st.metric("Paper Unrealized P/L", f"${paper_unrealized:.2f}", delta=f"${paper_unrealized:.2f}", delta_color=color)
+    else:
+        # Live Account Balance Fetch
+        live_bal = 0
+        if client:
+            try:
+                bal_data = client.get_balance()
+                live_bal = D(bal_data.get("balance", 0)) / D(100)
+            except: pass
+        with c_dash3:
+            st.metric("Live Balance", f"${live_bal:.2f}")
+        with c_dash4:
+            st.metric("Live P/L", "Check Kalshi App")
+
+    with c_dash5:
+        st.metric("Market", st.session_state.active_ticker or "--")
+    with c_dash6:
+        price_display = f"{st.session_state.last_price}¢" if st.session_state.last_price else "--"
+        st.metric("Ask Price", price_display)
+
+    # Bot Execution Loop
     if st.session_state.running and client:
         run_bot_cycle(client, daily_spent)
     elif not st.session_state.running:
         st.info("Bot is stopped. Choose your settings and press 'START AUTOTRADING'.")
+
+    # Paper Positions Visualizer
+    if trading_mode == "PAPER TRADING" and any(p["contracts"] > 0 for p in st.session_state.paper_positions.values()):
+        st.subheader("💼 Active Paper Positions")
+        active_pos_list = []
+        for t, p_data in st.session_state.paper_positions.items():
+            if p_data["contracts"] > 0:
+                active_pos_list.append({
+                    "Ticker": t,
+                    "Outcome": p_data["outcome"],
+                    "Contracts": p_data["contracts"],
+                    "Avg Entry": f"${p_data['avg_cost']:.4f}",
+                    "Total Cost": f"${(p_data['contracts'] * p_data['avg_cost']):.2f}"
+                })
+        st.dataframe(active_pos_list, use_container_width=True, hide_index=True)
 
     st.subheader("📜 Bot Log")
     if st.session_state.logs:
@@ -915,7 +994,7 @@ def render_dashboard_and_tick():
         st.info("Waiting for bot activity...")
 
     if st.session_state.paper_trades:
-        st.subheader("📝 Paper Trades")
+        st.subheader("📝 Paper Trades History")
         st.dataframe(st.session_state.paper_trades, use_container_width=True, hide_index=True)
 
     if not st.session_state.running and LOG_FILE.exists():
