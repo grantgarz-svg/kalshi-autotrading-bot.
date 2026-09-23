@@ -16,17 +16,17 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 
 # ============================================================
-# PAGE
+# PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
-    page_title="Kalshi Scalper",
+    page_title="Kalshi Scalper Pro",
     page_icon="⚡",
     layout="wide",
 )
 
-st.title("⚡ Kalshi Scalper")
-st.caption("Paper/live Kalshi trading dashboard with risk controls")
+st.title("⚡ Kalshi Scalper Pro")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with advanced risk controls")
 
 
 # ============================================================
@@ -37,7 +37,6 @@ PROD_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
 DEMO_BASE_URL = "https://external-api.demo.kalshi.co/trade-api/v2"
 
 LOG_FILE = Path("kalshi_orders.csv")
-
 ZERO = Decimal("0")
 
 MONTH_MAP = {
@@ -47,7 +46,7 @@ MONTH_MAP = {
 
 
 # ============================================================
-# SESSION STATE
+# SESSION STATE INITIALIZATION
 # ============================================================
 
 DEFAULTS = {
@@ -99,14 +98,15 @@ def append_order_log(row):
         "contracts", "price", "estimated_cost", "order_id", "client_order_id",
         "fill_count", "remaining_count", "status", "error",
     ]
-
     exists = LOG_FILE.exists()
-
-    with LOG_FILE.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        if not exists:
-            writer.writeheader()
-        writer.writerow({k: row.get(k, "") for k in fields})
+    try:
+        with LOG_FILE.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            if not exists:
+                writer.writeheader()
+            writer.writerow({k: row.get(k, "") for k in fields})
+    except Exception as e:
+        log(f"CSV Logging error: {e}")
 
 
 def load_private_key(text):
@@ -122,7 +122,6 @@ def load_private_key(text):
 
 def create_signature(private_key, timestamp, method, path):
     message = f"{timestamp}{method.upper()}{path}".encode("utf-8")
-
     signature = private_key.sign(
         message,
         padding.PSS(
@@ -131,21 +130,13 @@ def create_signature(private_key, timestamp, method, path):
         ),
         hashes.SHA256(),
     )
-
     return base64.b64encode(signature).decode("utf-8")
 
 
 def create_headers(key_id, private_key, method, url):
     timestamp = str(int(time.time() * 1000))
     path = urlparse(url).path
-
-    signature = create_signature(
-        private_key,
-        timestamp,
-        method,
-        path,
-    )
-
+    signature = create_signature(private_key, timestamp, method, path)
     return {
         "KALSHI-ACCESS-KEY": key_id,
         "KALSHI-ACCESS-SIGNATURE": signature,
@@ -166,13 +157,7 @@ class KalshiClient:
 
     def request(self, method, endpoint, params=None, body=None):
         url = self.base_url + endpoint
-
-        headers = create_headers(
-            self.key_id,
-            self.private_key,
-            method,
-            url,
-        )
+        headers = create_headers(self.key_id, self.private_key, method, url)
 
         response = requests.request(
             method=method,
@@ -188,26 +173,18 @@ class KalshiClient:
                 detail = response.json()
             except Exception:
                 detail = response.text
-
-            raise RuntimeError(
-                f"Kalshi API {response.status_code}: {detail}"
-            )
+            raise RuntimeError(f"Kalshi API {response.status_code}: {detail}")
 
         if not response.content:
             return {}
 
         return response.json()
 
-    def get_markets(self, series_ticker):
-        return self.request(
-            "GET",
-            "/markets",
-            params={
-                "series_ticker": series_ticker,
-                "status": "open",
-                "limit": 100,
-            },
-        )
+    def get_markets(self, series_ticker=None, limit=100):
+        params = {"status": "open", "limit": limit}
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        return self.request("GET", "/markets", params=params)
 
     def get_market(self, ticker):
         return self.request("GET", f"/markets/{ticker}")
@@ -261,7 +238,7 @@ class KalshiClient:
 
 
 # ============================================================
-# MARKET HELPERS
+# MARKET HELPERS & RATE-LIMIT SAFE DISCOVERY
 # ============================================================
 
 def parse_time(value):
@@ -278,17 +255,12 @@ def parse_time(value):
 
 def market_minutes_remaining(market):
     close = parse_time(market.get("close_time")) or parse_time(market.get("expiration_time"))
-
     if close is None:
         return None
-
     return (close - now_utc()).total_seconds() / 60
 
 
 def get_live_ask_price(client, ticker, outcome_to_trade):
-    """
-    Directly queries Kalshi's orderbook endpoint to fetch real executable ask prices.
-    """
     try:
         res = client.get_orderbook(ticker)
         ob = res.get("orderbook", res)
@@ -314,14 +286,24 @@ def get_live_ask_price(client, ticker, outcome_to_trade):
         return 0
 
 
-def find_active_market(client, markets, min_expiry_mins=0, outcome_to_trade="YES"):
+def find_active_market(client, series_ticker, min_expiry_mins=0, outcome_to_trade="YES"):
+    markets = []
+    try:
+        res = client.get_markets(series_ticker=series_ticker)
+        markets = res.get("markets", [])
+    except Exception:
+        pass
+
+    if not markets:
+        try:
+            res = client.get_markets(limit=200)
+            all_markets = res.get("markets", [])
+            markets = [m for m in all_markets if series_ticker.upper() in m.get("ticker", "").upper()]
+        except Exception:
+            pass
+
     open_markets = [m for m in markets if m.get("status") in (None, "open", "active")]
-    valid_markets = []
-    
-    for m in open_markets:
-        mins = market_minutes_remaining(m)
-        if mins is not None and mins > min_expiry_mins:
-            valid_markets.append(m)
+    valid_markets = [m for m in open_markets if market_minutes_remaining(m) is not None and market_minutes_remaining(m) > min_expiry_mins]
 
     if not valid_markets:
         return None
@@ -340,16 +322,22 @@ def find_active_market(client, markets, min_expiry_mins=0, outcome_to_trade="YES
         current_window = windows[w_key]
         current_window.sort(key=lambda x: x.get("ticker", ""))
         
-        # Scan orderbooks directly to find the first strike with an active ask
-        for m in current_window:
-            t = m.get("ticker")
-            ask = get_live_ask_price(client, t, outcome_to_trade)
-            if ask > 0 and ask < 100:
-                return m
-
-        # Fallback to middle strike if no direct orderbook matches found instantly
+        # RATE-LIMIT SAFE CHECK: Inspect middle (ATM) strike first to avoid spamming API orderbooks
         if current_window:
-            return current_window[len(current_window) // 2]
+            mid_idx = len(current_window) // 2
+            candidate = current_window[mid_idx]
+            ask = get_live_ask_price(client, candidate.get("ticker"), outcome_to_trade)
+            if ask > 0 and ask < 100:
+                return candidate
+            
+            # If ATM doesn't have immediate ask, check remaining strikes in window
+            for m in current_window:
+                t = m.get("ticker")
+                ask = get_live_ask_price(client, t, outcome_to_trade)
+                if ask > 0 and ask < 100:
+                    return m
+                    
+            return candidate
 
     return None
 
@@ -373,17 +361,13 @@ def extract_position(positions_response, ticker):
         row_ticker = row.get("ticker") or row.get("market_ticker")
         if row_ticker != ticker:
             continue
-            
         raw = row.get("position_fp") if row.get("position_fp") is not None else row.get("position")
         position = D(raw)
-
         if position > 0:
             return {"ticker": ticker, "outcome": "YES", "contracts": position}
         if position < 0:
             return {"ticker": ticker, "outcome": "NO", "contracts": abs(position)}
-            
         return {"ticker": ticker, "outcome": None, "contracts": ZERO}
-        
     return {"ticker": ticker, "outcome": None, "contracts": ZERO}
 
 
@@ -392,25 +376,18 @@ def fill_outcome(fill):
     if outcome:
         return str(outcome).upper()
     book_side = str(fill.get("book_side", "")).lower()
-    if book_side == "bid":
-        return "YES"
-    if book_side == "ask":
-        return "NO"
+    if book_side == "bid": return "YES"
+    if book_side == "ask": return "NO"
     return None
 
 
 def fill_action(fill):
     action = fill.get("action")
-    if action:
-        return str(action).upper()
-    return None
+    return str(action).upper() if action else None
 
 
 def fill_price(fill, outcome):
-    if outcome == "YES":
-        raw = fill.get("yes_price_dollars") or fill.get("yes_price")
-    else:
-        raw = fill.get("no_price_dollars") or fill.get("no_price")
+    raw = fill.get("yes_price_dollars") or fill.get("yes_price") if outcome == "YES" else fill.get("no_price_dollars") or fill.get("no_price")
     value = D(raw)
     if value > 1:
         value = value / D(100)
@@ -433,23 +410,19 @@ def reconstruct_average_entry(fills, ticker, outcome):
         action = fill_action(fill)
         if action not in ("BUY", "SELL"):
             continue
-            
         qty = fill_count(fill)
         price = fill_price(fill, outcome)
         if qty <= 0 or price <= 0:
             continue
-            
         created = fill.get("created_time") or fill.get("ts") or ""
         relevant.append((str(created), action, qty, price))
 
     relevant.sort(key=lambda x: x[0])
     lots = []
-
     for _, action, qty, price in relevant:
         if action == "BUY":
             lots.append([qty, price])
             continue
-
         remaining = qty
         while remaining > 0 and lots:
             lot_qty, lot_price = lots[0]
@@ -464,7 +437,6 @@ def reconstruct_average_entry(fills, ticker, outcome):
     total_qty = sum((lot[0] for lot in lots), ZERO)
     if total_qty <= 0:
         return None
-
     total_cost = sum((lot_qty * lot_price for lot_qty, lot_price in lots), ZERO)
     return total_cost / total_qty
 
@@ -478,7 +450,6 @@ def calculate_daily_spend(client):
     fills_response = client.get_fills(min_ts=utc_day_start_timestamp())
     fills = fills_response.get("fills", [])
     total = ZERO
-
     for fill in fills:
         if str(fill.get("action", "")).lower() != "buy":
             continue
@@ -489,7 +460,6 @@ def calculate_daily_spend(client):
         price = fill_price(fill, outcome)
         fee = D(fill.get("fee_cost", 0))
         total += (qty * price) + fee
-
     return total
 
 
@@ -561,8 +531,7 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
             "client_order_id": client_order_id, "fill_count": f"{fill_count_value:.2f}",
             "remaining_count": f"{remaining:.2f}", "status": status, "error": "",
         })
-        log(f"🟢 LIVE ORDER {action}: {contracts} {outcome} {ticker} @ {outcome_cents}¢ | filled={fill_count_value} | order={order_id}")
-        
+        log(f"🟢 LIVE ORDER {action}: {contracts} {outcome} {ticker} @ {outcome_cents}¢ | filled={fill_count_value}")
         return {
             "order_id": order_id, "client_order_id": client_order_id,
             "fill_count": fill_count_value, "remaining_count": remaining, "status": status,
@@ -583,10 +552,8 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
 def confirm_fill(client, order_id, timeout_seconds=4):
     if not order_id:
         return ZERO, ZERO, "unknown"
-
     deadline = time.time() + timeout_seconds
     latest = None
-
     while time.time() < deadline:
         try:
             response = client.get_order(order_id)
@@ -595,7 +562,6 @@ def confirm_fill(client, order_id, timeout_seconds=4):
             filled = D(order.get("fill_count") or order.get("fill_count_fp"))
             remaining = D(order.get("remaining_count") or order.get("remaining_count_fp"))
             status = order.get("status", "unknown")
-
             if filled > 0 or status in ("canceled", "executed", "filled"):
                 return filled, remaining, status
         except Exception:
@@ -618,7 +584,6 @@ def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pc
     ticker = position["ticker"]
     outcome = position["outcome"]
     contracts = int(position["contracts"])
-
     if outcome not in ("YES", "NO"):
         return False
 
@@ -641,14 +606,12 @@ def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pc
         
         if current_bid <= 0:
             return False
-            
     except Exception as error:
         log(f"TP/SL price fetch error: {error}")
         return False
 
     entry = reconstruct_average_entry(fills, ticker, outcome)
     if entry is None:
-        log(f"Position {ticker} {outcome} has no reconstructed entry price; TP/SL skipped.")
         return False
 
     current = D(current_bid) / D(100)
@@ -665,7 +628,6 @@ def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pc
         return False
 
     log(f"🚨 {reason}: {ticker} {outcome} entry=${entry:.4f}, bid=${current:.4f}")
-
     result = submit_trade(
         client=client, mode=mode, ticker=ticker, outcome=outcome,
         action="SELL", contracts=contracts, outcome_cents=current_bid, reduce_only=True,
@@ -679,12 +641,11 @@ def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pc
 
 
 # ============================================================
-# SIDEBAR
+# SIDEBAR CONTROLS
 # ============================================================
 
 with st.sidebar:
     st.header("🔑 Account")
-
     trading_mode = st.radio("Trading mode", ["PAPER TRADING", "LIVE TRADING"], index=0)
     demo_mode = st.checkbox("Use Kalshi Demo API", value=True)
 
@@ -696,14 +657,12 @@ with st.sidebar:
 
     st.divider()
     st.header("📊 Market")
-
     series_ticker = st.text_input("Market Series", value="KXBTC15M")
     display_outcome = st.selectbox("Entry outcome", ["UP", "DOWN"])
     outcome_to_trade = "YES" if display_outcome == "UP" else "NO"
 
     st.divider()
     st.header("💰 Risk Settings")
-
     max_dollars_trade = st.number_input("Maximum dollars per trade", min_value=0.01, max_value=10000.00, value=10.00, step=1.00)
     daily_cap = st.number_input("Daily spending cap", min_value=0.01, max_value=100000.00, value=100.00, step=5.00)
     max_entry = st.slider("Maximum entry price", min_value=1, max_value=99, value=75, format="%d¢")
@@ -734,11 +693,11 @@ if trading_mode == "LIVE TRADING":
     confirmation = st.text_input("Type LIVE I UNDERSTAND to enable live orders", type="password")
     live_confirmed = (confirmation.strip() == "LIVE I UNDERSTAND")
     if not live_confirmed:
-        st.error("Live orders are locked until the confirmation phrase is entered.")
+        st.error("Live orders are locked until confirmation phrase is entered.")
 
 
 # ============================================================
-# START / STOP
+# START / STOP ACTIONS
 # ============================================================
 
 c1, c2, c3 = st.columns(3)
@@ -749,7 +708,7 @@ with c1:
         elif not private_key_text:
             st.error("Provide the private key.")
         elif trading_mode == "LIVE TRADING" and not live_confirmed:
-            st.error("Live confirmation is required.")
+            st.error("Live confirmation required.")
         else:
             st.session_state.running = True
             st.session_state.emergency_stop = False
@@ -769,13 +728,12 @@ with c3:
         log("🛑 EMERGENCY STOP ACTIVATED.")
         st.rerun()
 
-
 if st.session_state.emergency_stop:
-    st.error("🛑 EMERGENCY STOP IS ACTIVE. Press START only after reviewing your settings.")
+    st.error("🛑 EMERGENCY STOP IS ACTIVE. Press START only after reviewing settings.")
 
 
 # ============================================================
-# BOT ENGINE (Runs autonomously via st.fragment without blocking UI)
+# BOT ENGINE LOOP (Non-blocking via Streamlit Fragment)
 # ============================================================
 
 def run_bot_cycle(client, daily_spent):
@@ -785,14 +743,13 @@ def run_bot_cycle(client, daily_spent):
         return
 
     if trading_mode == "LIVE TRADING" and demo_mode:
-        st.error("LIVE TRADING selected while Demo API is enabled. Disable 'Use Kalshi Demo API'.")
+        st.error("LIVE TRADING selected while Demo API is enabled.")
         st.session_state.running = False
         st.rerun()
         return
 
     current_time = dt.datetime.now().time()
     if not (start_time <= current_time <= end_time):
-        log("Outside trading hours.")
         return
 
     if daily_spent >= D(daily_cap):
@@ -803,22 +760,19 @@ def run_bot_cycle(client, daily_spent):
         return
 
     try:
-        markets_response = client.get_markets(series_ticker)
-        market = find_active_market(client, markets_response.get("markets", []), min_expiry_mins=float(min_minutes_to_expiry), outcome_to_trade=outcome_to_trade)
-
+        market = find_active_market(client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), outcome_to_trade=outcome_to_trade)
         if not market:
-            log(f"No active open market found for {series_ticker}.")
+            log(f"No liquid open market found for {series_ticker}.")
             return
 
         ticker = market.get("ticker")
         st.session_state.active_ticker = ticker
     except Exception as error:
-        log(f"Market error: {error}")
+        log(f"Market discovery error: {error}")
         return
 
     try:
         entry_price = get_live_ask_price(client, ticker, outcome_to_trade)
-
         if entry_price <= 0 or entry_price >= 100:
             log(f"{ticker}: no {outcome_to_trade} ask available.")
             return
@@ -848,7 +802,6 @@ def run_bot_cycle(client, daily_spent):
 
     already_in_target_position = (position["contracts"] > 0 and position["outcome"] == outcome_to_trade)
     if already_in_target_position:
-        log(f"Duplicate protection: already holding {position['contracts']:.2f} {outcome_to_trade} in {ticker}.")
         return
 
     signal = entry_price <= max_entry
@@ -882,10 +835,8 @@ def run_bot_cycle(client, daily_spent):
                         st.session_state.bot_positions[ticker] = {"outcome": outcome_to_trade, "contracts": str(filled)}
                 else:
                     st.session_state.bot_positions[ticker] = {"outcome": outcome_to_trade, "contracts": str(contracts)}
-            except Exception:
-                pass
-    else:
-        log(f"{ticker}: {outcome_to_trade} ask {entry_price}¢ > max {max_entry}¢ or cooldown/position protection active.")
+            except Exception as e:
+                log(f"Order submission error exception caught: {e}")
 
 
 @st.fragment(run_every=3)
