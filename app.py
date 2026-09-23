@@ -306,10 +306,6 @@ def get_market_prices(market):
 
 
 def find_active_market(markets, min_expiry_mins=0):
-    """
-    Optimized selector: Groups open markets by expiration window 
-    and selects the At-The-Money (ATM) contract without rate-limiting API loops.
-    """
     open_markets = [m for m in markets if m.get("status") in (None, "open", "active")]
     valid_markets = []
     
@@ -321,7 +317,6 @@ def find_active_market(markets, min_expiry_mins=0):
     if not valid_markets:
         return None
 
-    # Group valid markets by their unique expiration closing windows (rounded to nearest minute)
     windows = {}
     for m in valid_markets:
         mins = market_minutes_remaining(m)
@@ -334,21 +329,10 @@ def find_active_market(markets, min_expiry_mins=0):
     
     for w_key in sorted_windows:
         current_window = windows[w_key]
-        if not current_window:
-            continue
-            
-        # Select the ATM contract by looking for midpoint closest to 50¢ or fallback to middle strike
-        def atm_score(m):
-            p = get_market_prices(m)
-            bid = p.get("yes_bid")
-            ask = p.get("yes_ask")
-            if bid is None or ask is None or bid <= 0 or ask <= 0 or ask >= 100:
-                return 50  # Default score if bulk prices are unpopulated
-            midpoint = (bid + ask) / 2
-            return abs(midpoint - 50)
-
-        current_window.sort(key=atm_score)
-        return current_window[0]
+        if current_window:
+            # Pick the middle strike of the active window cluster
+            current_window.sort(key=lambda x: x.get("ticker", ""))
+            return current_window[len(current_window) // 2]
 
     return None
 
@@ -804,12 +788,16 @@ def run_bot_cycle(client, daily_spent):
         log(f"Market error: {error}")
         return
 
+    # FIX: Fetch live individual market pricing directly, bypassing bulk cache zeros
     try:
-        prices = get_market_prices(market)
+        detail = client.get_market(ticker)
+        market_detail = detail.get("market", detail)
+        prices = get_market_prices(market_detail)
+        
         entry_price = prices["yes_ask"] if outcome_to_trade == "YES" else prices["no_ask"]
 
         if entry_price is None or entry_price <= 0 or entry_price >= 100:
-            log(f"{ticker}: no {outcome_to_trade} ask available in bulk payload.")
+            log(f"{ticker}: no {outcome_to_trade} ask available.")
             return
 
         st.session_state.last_price = entry_price
