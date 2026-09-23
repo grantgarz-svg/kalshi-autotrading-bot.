@@ -33,7 +33,6 @@ st.caption("Paper/live Kalshi trading dashboard with risk controls")
 # CONSTANTS
 # ============================================================
 
-# UPDATED: Using the recommended external-api hosts for V2 routing
 PROD_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
 DEMO_BASE_URL = "https://external-api.demo.kalshi.co/trade-api/v2"
 
@@ -138,7 +137,6 @@ def create_signature(private_key, timestamp, method, path):
 
 def create_headers(key_id, private_key, method, url):
     timestamp = str(int(time.time() * 1000))
-    # Correctly strips query string parameters as required by Kalshi API
     path = urlparse(url).path
 
     signature = create_signature(
@@ -266,32 +264,6 @@ class KalshiClient:
 # MARKET HELPERS
 # ============================================================
 
-def parse_ticker_expiry(ticker):
-    if not ticker:
-        return None
-
-    parts = str(ticker).split("-")
-    if len(parts) >= 2:
-        date_str = parts[1].upper()
-        match = re.match(r"^(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})$", date_str)
-        if match:
-            yy, mmm, dd, hh, mm = match.groups()
-            month = MONTH_MAP.get(mmm)
-            if month:
-                try:
-                    return dt.datetime(
-                        year=2000 + int(yy),
-                        month=month,
-                        day=int(dd),
-                        hour=int(hh),
-                        minute=int(mm),
-                        tzinfo=dt.timezone.utc,
-                    )
-                except Exception:
-                    pass
-    return None
-
-
 def parse_time(value):
     if not value:
         return None
@@ -305,11 +277,7 @@ def parse_time(value):
 
 
 def market_minutes_remaining(market):
-    ticker = market.get("ticker", "")
-    close = parse_ticker_expiry(ticker)
-
-    if close is None:
-        close = parse_time(market.get("close_time")) or parse_time(market.get("expiration_time"))
+    close = parse_time(market.get("close_time")) or parse_time(market.get("expiration_time"))
 
     if close is None:
         return None
@@ -773,7 +741,6 @@ if st.session_state.emergency_stop:
 # ============================================================
 
 def run_bot_cycle(client, daily_spent):
-    """Executes a single cycle of the trading bot's logic."""
     if st.session_state.emergency_stop:
         st.session_state.running = False
         st.rerun()
@@ -896,10 +863,8 @@ def run_bot_cycle(client, daily_spent):
 
 @st.fragment(run_every=3)
 def render_dashboard_and_tick():
-    """Renders the dashboard components and runs the bot cycle non-blocking."""
     st.subheader("Dashboard")
     
-    # Initialize Client and Calculate Spend
     client = None
     daily_spent = ZERO
     
@@ -920,7 +885,6 @@ def render_dashboard_and_tick():
     elif trading_mode == "PAPER TRADING":
         daily_spent = sum((D(str(row["Cost"]).replace("$", "")) for row in st.session_state.paper_trades), ZERO)
 
-    # Dashboard Metrics
     c_dash1, c_dash2, c_dash3, c_dash4, c_dash5 = st.columns(5)
     with c_dash1:
         st.metric("Mode", trading_mode)
@@ -934,25 +898,21 @@ def render_dashboard_and_tick():
     with c_dash5:
         st.metric("Last Fill", f"{st.session_state.last_fill_count:.2f}")
 
-    # Run Bot Cycle if Active
     if st.session_state.running and client:
         run_bot_cycle(client, daily_spent)
     elif not st.session_state.running:
         st.info("Bot is stopped. Choose your settings and press 'START AUTOTRADING'.")
 
-    # Render Logs
     st.subheader("📜 Bot Log")
     if st.session_state.logs:
         st.code("\n".join(st.session_state.logs[-30:]))
     else:
         st.info("Waiting for bot activity...")
 
-    # Render Paper Trades
     if st.session_state.paper_trades:
         st.subheader("📝 Paper Trades")
         st.dataframe(st.session_state.paper_trades, use_container_width=True, hide_index=True)
 
-    # Render Download Button if Logs exist and stopped
     if not st.session_state.running and LOG_FILE.exists():
         st.download_button(
             "⬇️ Download order log",
@@ -961,5 +921,4 @@ def render_dashboard_and_tick():
             mime="text/csv",
         )
 
-# Execute the fragment
 render_dashboard_and_tick()
