@@ -317,7 +317,6 @@ def find_active_market(client, markets, min_expiry_mins=0):
     if not valid_markets:
         return None
 
-    # Group valid markets by their unique expiration closing windows
     windows = {}
     for m in valid_markets:
         mins = market_minutes_remaining(m)
@@ -331,20 +330,17 @@ def find_active_market(client, markets, min_expiry_mins=0):
     for w_key in sorted_windows:
         current_window = windows[w_key]
         
-        # Check orderbooks live to find the first genuinely liquid strike in this window
         for m in current_window:
             t = m.get("ticker")
             try:
-                ob_res = client.get_orderbook(t)
-                ob = ob_res.get("orderbook", ob_res)
-                y_levels = ob.get("yes", []) or ob.get("yes_bids", [])
-                n_levels = ob.get("no", []) or ob.get("no_bids", [])
-                if y_levels or n_levels:
-                    return m
+                det = client.get_market(t)
+                m_detail = det.get("market", det)
+                p = get_market_prices(m_detail)
+                if p.get("yes_bid") or p.get("yes_ask") or p.get("no_bid"):
+                    return m_detail
             except Exception:
                 continue
 
-        # If none of the strikes in this window returned orderbook data, fallback to first in window
         if current_window:
             return current_window[0]
 
@@ -620,25 +616,12 @@ def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pc
         return False
 
     try:
-        ob_response = client.get_orderbook(ticker)
-        ob = ob_response.get("orderbook", ob_response)
+        det = client.get_market(ticker)
+        m_detail = det.get("market", det)
+        prices = get_market_prices(m_detail)
+        current_bid = prices["yes_bid"] if outcome == "YES" else prices["no_bid"]
         
-        yes_levels = ob.get("yes", []) or ob.get("yes_bids", [])
-        no_levels = ob.get("no", []) or ob.get("no_bids", [])
-        
-        def get_best_price(levels):
-            if not levels: return 0
-            lvl = levels[0]
-            if isinstance(lvl, dict): return int(lvl.get("price", 0))
-            if isinstance(lvl, (list, tuple)): return int(lvl[0])
-            return 0
-            
-        yes_bid = get_best_price(yes_levels)
-        no_bid = get_best_price(no_levels)
-        
-        current_bid = yes_bid if outcome == "YES" else no_bid
-        
-        if current_bid <= 0:
+        if current_bid is None or current_bid <= 0:
             return False
             
     except Exception as error:
@@ -816,28 +799,10 @@ def run_bot_cycle(client, daily_spent):
         return
 
     try:
-        ob_response = client.get_orderbook(ticker)
-        ob = ob_response.get("orderbook", ob_response)
-        
-        yes_levels = ob.get("yes", []) or ob.get("yes_bids", [])
-        no_levels = ob.get("no", []) or ob.get("no_bids", [])
-        
-        def get_best_price(levels):
-            if not levels: return 0
-            lvl = levels[0]
-            if isinstance(lvl, dict): return int(lvl.get("price", 0))
-            if isinstance(lvl, (list, tuple)): return int(lvl[0])
-            return 0
-            
-        yes_bid = get_best_price(yes_levels)
-        no_bid = get_best_price(no_levels)
-        
-        yes_ask = (100 - no_bid) if no_bid > 0 else 0
-        no_ask = (100 - yes_bid) if yes_bid > 0 else 0
+        prices = get_market_prices(market)
+        entry_price = prices["yes_ask"] if outcome_to_trade == "YES" else prices["no_ask"]
 
-        entry_price = yes_ask if outcome_to_trade == "YES" else no_ask
-
-        if not entry_price or entry_price <= 0 or entry_price >= 100:
+        if entry_price is None or entry_price <= 0 or entry_price >= 100:
             log(f"{ticker}: no {outcome_to_trade} ask.")
             return
 
