@@ -523,7 +523,6 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
         contracts_d = D(contracts)
         price_d = D(outcome_cents) / D(100)
         
-        # Initialize ticker in paper ledger if it doesn't exist
         if ticker not in st.session_state.paper_positions:
             st.session_state.paper_positions[ticker] = {"contracts": ZERO, "avg_cost": ZERO, "outcome": outcome}
             
@@ -807,7 +806,7 @@ def run_bot_cycle(client, daily_spent):
         return
 
     # ==========================================
-    # POSITIONS ROUTING (LIVE vs PAPER)
+    # POSITIONS ROUTING
     # ==========================================
     position = {"contracts": ZERO}
     avg_entry = None
@@ -823,7 +822,6 @@ def run_bot_cycle(client, daily_spent):
             log(f"Position/fill error: {error}")
             return
     else:
-        # Paper Routing
         p_pos = st.session_state.paper_positions.get(ticker, {"contracts": ZERO, "avg_cost": ZERO, "outcome": outcome_to_trade})
         position = {"ticker": ticker, "outcome": outcome_to_trade, "contracts": p_pos["contracts"]}
         avg_entry = p_pos["avg_cost"] if p_pos["contracts"] > 0 else None
@@ -847,7 +845,6 @@ def run_bot_cycle(client, daily_spent):
                 st.rerun()
                 return
 
-    # Duplicate protection check (ensures we don't spam buys if we already hold contracts)
     already_in_target_position = (position["contracts"] > 0 and position["outcome"] == outcome_to_trade)
     if already_in_target_position:
         return
@@ -913,17 +910,15 @@ def render_dashboard_and_tick():
                 st.session_state.running = False
                 st.rerun()
 
-    # Calculate Daily Spent based on Mode
+    # FIX: Robust fallback using .get() prevents KeyError if older entries only have "Cost" instead of "Cost/Value"
     if client and trading_mode == "LIVE TRADING":
         try:
             daily_spent = calculate_daily_spend(client)
         except Exception:
             pass
     elif trading_mode == "PAPER TRADING":
-        # Sum paper buy costs
-        daily_spent = sum((D(str(row["Cost/Value"]).replace("$", "")) for row in st.session_state.paper_trades if row["Action"] == "BUY"), ZERO)
+        daily_spent = sum((D(str(row.get("Cost/Value", row.get("Cost", "0"))).replace("$", "")) for row in st.session_state.paper_trades if row.get("Action") == "BUY"), ZERO)
 
-    # Calculate Dynamic Paper Unrealized PnL
     paper_unrealized = ZERO
     if client and trading_mode == "PAPER TRADING":
         for t, p_data in st.session_state.paper_positions.items():
@@ -933,7 +928,6 @@ def render_dashboard_and_tick():
                     current_val = D(current_bid_cents) / D(100)
                     paper_unrealized += (current_val - p_data["avg_cost"]) * p_data["contracts"]
 
-    # Dashboard Metrics Render
     c_dash1, c_dash2, c_dash3, c_dash4, c_dash5, c_dash6 = st.columns(6)
     with c_dash1:
         st.metric("Mode", trading_mode)
@@ -944,11 +938,9 @@ def render_dashboard_and_tick():
         with c_dash3:
             st.metric("Paper Realized P/L", f"${st.session_state.paper_realized_pnl:.2f}")
         with c_dash4:
-            # Color format based on profit/loss
             color = "normal" if paper_unrealized == 0 else ("inverse" if paper_unrealized < 0 else "normal")
             st.metric("Paper Unrealized P/L", f"${paper_unrealized:.2f}", delta=f"${paper_unrealized:.2f}", delta_color=color)
     else:
-        # Live Account Balance Fetch
         live_bal = 0
         if client:
             try:
@@ -966,13 +958,11 @@ def render_dashboard_and_tick():
         price_display = f"{st.session_state.last_price}¢" if st.session_state.last_price else "--"
         st.metric("Ask Price", price_display)
 
-    # Bot Execution Loop
     if st.session_state.running and client:
         run_bot_cycle(client, daily_spent)
     elif not st.session_state.running:
         st.info("Bot is stopped. Choose your settings and press 'START AUTOTRADING'.")
 
-    # Paper Positions Visualizer
     if trading_mode == "PAPER TRADING" and any(p["contracts"] > 0 for p in st.session_state.paper_positions.values()):
         st.subheader("💼 Active Paper Positions")
         active_pos_list = []
