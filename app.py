@@ -17,7 +17,7 @@ with st.sidebar:
     st.header("🔑 Account Setup")
     st.info("Your keys are never saved. They reset when you close the page.")
     key_id = st.text_input("Kalshi Key ID", type="password")
-    private_key_text = st.text_area("Private Key (Paste full contents here)"
+    private_key_text = st.text_area("Private Key (Paste full contents here))
     ticker = st.text_input("Market Ticker", value="KXBTC-26SEP22-T65000")
 
 st.subheader("Configuration")
