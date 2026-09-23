@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with live activity logging")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with precise API v2 orderbook mapping")
 
 
 # ============================================================
@@ -238,7 +238,7 @@ class KalshiClient:
 
 
 # ============================================================
-# MARKET HELPERS & MULTI-STRIKE LIQUIDITY SCANNER
+# MARKET HELPERS & RATE-LIMIT SAFE DISCOVERY
 # ============================================================
 
 def parse_time(value):
@@ -261,49 +261,70 @@ def market_minutes_remaining(market):
 
 
 def get_live_ask_price(client, ticker, outcome_to_trade):
+    """
+    Directly queries Kalshi's orderbook endpoint, correctly unwrapping the orderbook_fp object
+    and pulling the LAST element (which represents the top of the book / highest bid).
+    """
     try:
         res = client.get_orderbook(ticker)
-        ob = res.get("orderbook", res)
         
-        yes_levels = ob.get("yes", []) or ob.get("yes_bids", [])
-        no_levels = ob.get("no", []) or ob.get("no_bids", [])
+        # Kalshi V2 puts the strings in `orderbook_fp` under `yes_dollars` and `no_dollars`
+        ob = res.get("orderbook_fp") or res.get("orderbook") or res
+        
+        yes_levels = ob.get("yes_dollars") or ob.get("yes") or []
+        no_levels = ob.get("no_dollars") or ob.get("no") or []
         
         def extract_best(levels):
             if not levels: return 0
-            lvl = levels[0]
-            if isinstance(lvl, dict): return int(lvl.get("price", 0))
-            if isinstance(lvl, (list, tuple)): return int(lvl[0])
+            
+            # CRITICAL FIX: The arrays are sorted ascending. The BEST bid is the LAST element.
+            lvl = levels[-1] 
+            
+            # Standard V2 FP arrays return `["0.4200", "13.00"]`
+            if isinstance(lvl, (list, tuple)): 
+                return int(float(lvl[0]) * 100) # Convert "0.4200" -> 42 cents
+            
+            if isinstance(lvl, dict): 
+                return int(float(lvl.get("price", 0)) * 100)
+                
             return 0
 
         yes_bid = extract_best(yes_levels)
         no_bid = extract_best(no_levels)
         
+        # Binary math: Yes Ask = 100 - No Bid
         yes_ask = (100 - no_bid) if no_bid > 0 else 0
         no_ask = (100 - yes_bid) if yes_bid > 0 else 0
 
         return yes_ask if outcome_to_trade == "YES" else no_ask
-    except Exception:
+        
+    except Exception as e:
+        log(f"Orderbook parse error for {ticker}: {str(e)}")
         return 0
 
 
 def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, outcome_to_trade="YES"):
     markets = []
     try:
-        res = client.get_markets(series_ticker=series_ticker)
+        res = client.get_markets(series_ticker=series_ticker, limit=100)
         markets = res.get("markets", [])
     except Exception:
         pass
 
     if not markets:
         try:
-            res = client.get_markets(limit=200)
+            res = client.get_markets(limit=250)
             all_markets = res.get("markets", [])
             markets = [m for m in all_markets if series_ticker.upper() in m.get("ticker", "").upper()]
         except Exception:
             pass
 
-    open_markets = [m for m in markets if m.get("status") in (None, "open", "active")]
+    open_markets = [m for m in markets if str(m.get("status", "")).lower() not in ("closed", "settled", "finalized")]
     valid_markets = [m for m in open_markets if market_minutes_remaining(m) is not None and market_minutes_remaining(m) > min_expiry_mins]
+
+    if not valid_markets:
+        # Fallback to catching expiring markets if the buffer is empty
+        valid_markets = [m for m in open_markets if market_minutes_remaining(m) is not None and market_minutes_remaining(m) > 0]
 
     if not valid_markets:
         return None, 0
@@ -322,19 +343,26 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         current_window = windows[w_key]
         current_window.sort(key=lambda x: x.get("ticker", ""))
         
-        for m in current_window:
-            t = m.get("ticker")
-            ask = get_live_ask_price(client, t, outcome_to_trade)
+        if current_window:
+            # 1. Look at the At-The-Money strike first to save rate-limits
+            mid_idx = len(current_window) // 2
+            atm_market = current_window[mid_idx]
+            
+            ask = get_live_ask_price(client, atm_market.get("ticker"), outcome_to_trade)
             if 0 < ask < 100:
-                return m, ask
+                return atm_market, ask
+                
+            time.sleep(0.1) # 100ms pause to respect 10req/sec limits
 
-    if sorted_windows:
-        fallback_window = windows[sorted_windows[0]]
-        if fallback_window:
-            fallback_market = fallback_window[len(fallback_window) // 2]
-            t = fallback_market.get("ticker")
-            ask = get_live_ask_price(client, t, outcome_to_trade)
-            return fallback_market, ask
+            # 2. If ATM is empty, scan the rest of the window
+            for m in current_window:
+                if m == atm_market:
+                    continue
+                t = m.get("ticker")
+                ask = get_live_ask_price(client, t, outcome_to_trade)
+                if 0 < ask < 100:
+                    return m, ask
+                time.sleep(0.1)
 
     return None, 0
 
@@ -586,15 +614,16 @@ def manage_position(client, mode, position, fills, take_profit_pct, stop_loss_pc
 
     try:
         res = client.get_orderbook(ticker)
-        ob = res.get("orderbook", res)
-        yes_levels = ob.get("yes", []) or ob.get("yes_bids", [])
-        no_levels = ob.get("no", []) or ob.get("no_bids", [])
+        ob = res.get("orderbook_fp") or res.get("orderbook") or res
+        
+        yes_levels = ob.get("yes_dollars") or ob.get("yes") or []
+        no_levels = ob.get("no_dollars") or ob.get("no") or []
         
         def extract_best(levels):
             if not levels: return 0
-            lvl = levels[0]
-            if isinstance(lvl, dict): return int(lvl.get("price", 0))
-            if isinstance(lvl, (list, tuple)): return int(lvl[0])
+            lvl = levels[-1]
+            if isinstance(lvl, (list, tuple)): return int(float(lvl[0]) * 100)
+            if isinstance(lvl, dict): return int(float(lvl.get("price", 0)) * 100)
             return 0
             
         yes_bid = extract_best(yes_levels)
@@ -757,19 +786,18 @@ def run_bot_cycle(client, daily_spent):
         return
 
     try:
-        log(f"Scanning {series_ticker} for active markets and liquidity...")
         market, entry_price = find_active_market_with_liquidity(
             client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), outcome_to_trade=outcome_to_trade
         )
 
         if not market or entry_price <= 0 or entry_price >= 100:
-            log(f"Waiting for liquidity or valid price window on {series_ticker}...")
+            log(f"Scanning {series_ticker}: No valid liquid markets found. Waiting...")
             return
 
         ticker = market.get("ticker")
         st.session_state.active_ticker = ticker
         st.session_state.last_price = entry_price
-        log(f"Found active market: {ticker} | Best Ask: {entry_price}¢")
+        log(f"Found active liquidity: {ticker} | Best {outcome_to_trade} Ask: {entry_price}¢")
     except Exception as error:
         log(f"Market discovery error: {error}")
         return
