@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with Dual Ask Price Visibility")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with Auto-Shard Routing")
 
 
 # ============================================================
@@ -350,7 +350,6 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
             ask_up = prices["YES"]["ask"]
             ask_down = prices["NO"]["ask"]
             
-            # Log current ask prices for both UP and DOWN for visibility
             log_once(f"scan_{t}", f"Scanning {t} | UP Ask: {ask_up}¢ | DOWN Ask: {ask_down}¢")
 
             if outcome_mode in ["YES", "BOTH"]:
@@ -698,7 +697,6 @@ with st.sidebar:
     max_dollars_trade = st.number_input("Maximum dollars per trade", min_value=0.01, max_value=10000.00, value=10.00, step=1.00)
     daily_cap = st.number_input("Daily spending cap", min_value=0.01, max_value=100000.00, value=100.00, step=5.00)
     
-    # Independent sliders based on outcome selection
     min_entry_up, max_entry_up = 15, 65
     min_entry_down, max_entry_down = 15, 65
 
@@ -719,7 +717,7 @@ with st.sidebar:
             max_entry_down = st.slider("Max DOWN", 1, 99, 65, format="%d¢", key="max_down")
         
     max_spread = st.slider("Max Bid/Ask Spread", min_value=1, max_value=50, value=5, format="%d¢")
-    cooldown = st.slider("Cooldown between entries", min_value=10, max_value=1800, value=60, step=10, format="%d seconds")
+    cooldown = st.slider("Cooldown between entries", min_value=10, max_value=1800, value=30, step=5, format="%d seconds")
     min_minutes_to_expiry = st.number_input("Do not enter if expiration is closer than", min_value=0.0, max_value=120.0, value=2.0, step=0.5)
     take_profit_pct = st.number_input("Take profit %", min_value=0.0, max_value=500.0, value=20.0, step=1.0)
     stop_loss_pct = st.number_input("Stop loss %", min_value=0.0, max_value=99.0, value=25.0, step=1.0)
@@ -734,40 +732,6 @@ with st.sidebar:
 
     st.divider()
     manage_existing = st.checkbox("Manage existing position for TP/SL", value=False)
-
-    st.divider()
-    st.header("🛠️ API Diagnostics & Shards")
-    st.caption("Fix insufficient balance by shifting funds to Crypto Shard 2.")
-    
-    if key_id and private_key_text:
-        if st.button("🔍 Check Raw API Balance", use_container_width=True):
-            try:
-                diag_client = KalshiClient(key_id, private_key_text, demo_mode)
-                with st.expander("API Balance Response", expanded=True):
-                    st.json(diag_client.get_balance())
-            except Exception as e:
-                st.error(f"Diagnostics Error: {e}")
-                
-        if st.button("⚡ Move All Balance to Crypto Shard (Index 2)", use_container_width=True, type="primary"):
-            try:
-                diag_client = KalshiClient(key_id, private_key_text, demo_mode)
-                diag_client.set_target_allocation(exchange_index=2, percent=100)
-                st.success("Successfully allocated 100% balance to Crypto Shard 2! Wait 10 seconds and try running.")
-            except Exception as e:
-                st.error(f"Shard Allocation Error: {e}")
-
-        if st.button("🧹 Cancel All Resting Orders", use_container_width=True, type="secondary"):
-            try:
-                diag_client = KalshiClient(key_id, private_key_text, demo_mode)
-                orders_resp = diag_client.get_orders(status="resting")
-                orders = orders_resp.get("orders", [])
-                count = 0
-                for o in orders:
-                    diag_client.cancel_order(o.get("order_id"))
-                    count += 1
-                st.success(f"Successfully sent cancel signal to {count} resting orders.")
-            except Exception as e:
-                st.error(f"Cancellation Error: {e}")
 
 
 # ============================================================
@@ -784,7 +748,7 @@ if trading_mode == "LIVE TRADING":
 
 
 # ============================================================
-# START / STOP ACTIONS
+# START / STOP ACTIONS (WITH AUTOMATIC SHARD ROUTING)
 # ============================================================
 
 c1, c2, c3 = st.columns(3)
@@ -797,6 +761,18 @@ with c1:
         elif trading_mode == "LIVE TRADING" and not live_confirmed:
             st.error("Live confirmation required.")
         else:
+            # AUTOMATICALLY ROUTE FUNDS TO CORRECT SHARD ON START
+            if trading_mode == "LIVE TRADING":
+                try:
+                    auto_client = KalshiClient(key_id, private_key_text, demo_mode)
+                    # Crypto series uses Shard 2; standard markets use Shard 0
+                    target_shard = 2 if "KXBTC" in series_ticker.upper() or "CRYPTO" in series_ticker.upper() else 0
+                    auto_client.set_target_allocation(exchange_index=target_shard, percent=100)
+                    log(f"⚡ Automatically routed 100% balance to Shard {target_shard} for {series_ticker}")
+                    time.sleep(1)
+                except Exception as e:
+                    log(f"⚠️ Auto-shard routing note: {e}")
+
             st.session_state.running = True
             st.session_state.emergency_stop = False
             log(f"Bot started in {trading_mode}. Demo API={demo_mode}.")
@@ -920,7 +896,6 @@ def run_bot_cycle(client, daily_spent):
     live_bid = prices[found_outcome]["bid"]
     spread = entry_price - live_bid
 
-    # Enforce correct outcome bounds
     cur_min = min_entry_up if found_outcome == "YES" else min_entry_down
     cur_max = max_entry_up if found_outcome == "YES" else max_entry_down
 
@@ -968,7 +943,7 @@ def run_bot_cycle(client, daily_spent):
                 error_str = str(e).lower()
                 log(f"Order submission error exception caught: {e}")
                 if "insufficient balance" in error_str or "insufficient_balance" in error_str:
-                    log("🛑 STOPPING BOT: Insufficient balance. Try clicking 'Move All Balance to Crypto Shard' in sidebar.")
+                    log("🛑 STOPPING BOT: Insufficient balance. Check funds in Kalshi app.")
                     st.session_state.emergency_stop = True
                     st.session_state.running = False
                     st.rerun()
