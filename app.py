@@ -20,13 +20,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 # ============================================================
 
 st.set_page_config(
-    page_title="KX Scalper Pro (Turbo Optimized)",
+    page_title="KX Scalper Pro (Live P/L Enabled)",
     page_icon="⚡",
     layout="wide",
 )
 
-st.title("⚡ KX Scalper Pro - Turbo Optimized (Zero Lag & Memory)")
-st.caption("High-frequency Kalshi trading dashboard with historical memory and instant chart rendering")
+st.title("⚡ KX Scalper Pro - Live P/L & Panic Exit")
+st.caption("High-frequency Kalshi trading dashboard with live portfolio P/L tracking")
 
 
 # ============================================================
@@ -52,6 +52,7 @@ DEFAULTS = {
     "paper_trades": [],
     "paper_positions": {},      
     "paper_realized_pnl": ZERO, 
+    "starting_live_balance": None,
     "last_trade_time": None,
     "active_ticker": None,
     "up_ask_display": "--",
@@ -91,7 +92,6 @@ def log(message):
     stamp = now_utc().strftime("%H:%M:%S")
     line = f"[{stamp}] {message}"
     st.session_state.logs.append(line)
-    # Capped at 30 logs max to prevent UI lag
     st.session_state.logs = st.session_state.logs[-30:]
 
 def log_once(msg_key, message):
@@ -112,7 +112,7 @@ def append_order_log(row):
             if not exists:
                 writer.writeheader()
             writer.writerow({k: row.get(k, "") for k in fields})
-    except Exception as e:
+    except Exception:
         pass
 
 
@@ -189,6 +189,9 @@ class KalshiClient:
             params["series_ticker"] = series_ticker
         return self.request("GET", "/markets", params=params)
 
+    def get_market(self, ticker):
+        return self.request("GET", f"/markets/{ticker}")
+
     def get_orderbook(self, ticker):
         return self.request("GET", f"/markets/{ticker}/orderbook")
 
@@ -238,7 +241,7 @@ class KalshiClient:
 
 
 # ============================================================
-# MARKET & HISTORICAL MEMORY HELPERS
+# MARKET & MEMORY HELPERS
 # ============================================================
 
 def parse_time(value):
@@ -286,16 +289,10 @@ def get_both_prices(client, ticker):
 
 
 def evaluate_historical_memory(price_history, intended_outcome):
-    """
-    Uses the bot's stored memory of past price action to confirm momentum.
-    """
     if len(price_history) < 5:
         return True
-    
-    # Calculate short-term velocity using historical memory
     recent = price_history[-10:]
     momentum = recent[-1] - recent[0]
-    
     if intended_outcome == "YES":
         return momentum >= -3
     else:
@@ -331,7 +328,6 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         st.session_state.up_ask_display = f"{ask_up}¢" if ask_up > 0 else "--"
         st.session_state.down_ask_display = f"{ask_down}¢" if ask_down > 0 else "--"
 
-        # Record into historical memory buffer (capped at 100 points for smooth performance)
         st.session_state.price_history.append(ask_up)
         st.session_state.price_history = st.session_state.price_history[-100:]
 
@@ -583,7 +579,7 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
         raise
 
 
-def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_loss_pct):
+def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_loss_pct, enable_panic, panic_mins):
     if position["contracts"] <= 0 or avg_entry is None:
         return False
 
@@ -594,6 +590,10 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
         return False
 
     try:
+        market_data = client.get_market(ticker)
+        market = market_data.get("market", market_data)
+        mins_left = market_minutes_remaining(market)
+
         prices = get_both_prices(client, ticker)
         if not prices: return False
         current_bid = prices[outcome]["bid"]
@@ -609,19 +609,21 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
     reason = None
     if take_profit_pct > 0 and current >= tp_price:
         reason = "TAKE PROFIT"
-    if stop_loss_pct > 0 and current <= sl_price:
+    elif stop_loss_pct > 0 and current <= sl_price:
         reason = "STOP LOSS"
+    elif enable_panic and mins_left is not None and mins_left <= panic_mins and current < avg_entry:
+        reason = "TIME PANIC EXIT"
 
     if reason is None:
         return False
 
-    log(f"🚨 {mode} {reason}: {ticker} {outcome} entry=${avg_entry:.4f}, bid=${current:.4f}")
+    log(f"🚨 {mode} {reason}: {ticker} {outcome} entry=${avg_entry:.4f}, bid=${current:.4f} (Mins left: {mins_left:.1f})")
     submit_trade(
         client=client, mode=mode, ticker=ticker, outcome=outcome,
         action="SELL", contracts=contracts, outcome_cents=current_bid, reduce_only=True,
     )
 
-    if reason == "STOP LOSS":
+    if reason in ("STOP LOSS", "TIME PANIC EXIT"):
         st.session_state.blacklisted_tickers.add(f"{ticker}_{outcome}")
         st.session_state["last_status_log"] = None 
 
@@ -644,7 +646,7 @@ with st.sidebar:
     private_key_text = st.text_area("Private Key PEM", value=private_key_default, height=180)
 
     st.divider()
-    st.header("📊 Market & Historical Memory")
+    st.header("📊 Market & Memory")
     series_ticker = st.text_input("Market Series", value="KXBTC15M")
     display_outcome = st.selectbox("Entry outcome", ["UP", "DOWN", "BOTH (UP & DOWN)"])
     if display_outcome == "UP":
@@ -654,10 +656,10 @@ with st.sidebar:
     else:
         outcome_mode = "BOTH"
         
-    use_memory_filter = st.checkbox("🧠 Enable Historical Memory Filter", value=True, help="Bot remembers past price action trends to make smarter trade decisions.")
+    use_memory_filter = st.checkbox("🧠 Enable Historical Memory Filter", value=True)
 
     st.divider()
-    st.header("💰 Risk Settings")
+    st.header("💰 Risk & Panic Exit")
     max_dollars_trade = st.number_input("Maximum dollars per trade", min_value=0.01, max_value=10000.00, value=2.00, step=0.50)
     daily_cap = st.number_input("Daily spending cap", min_value=0.01, max_value=100000.00, value=100.00, step=5.00)
     
@@ -686,6 +688,11 @@ with st.sidebar:
     
     take_profit_pct = st.number_input("Take profit %", min_value=0.0, max_value=500.0, value=8.0, step=1.0)
     stop_loss_pct = st.number_input("Stop loss %", min_value=0.0, max_value=99.0, value=15.0, step=1.0)
+
+    st.divider()
+    st.subheader("🚨 Time-Based Panic Exit")
+    enable_panic_exit = st.checkbox("Enable Panic Exit before expiry", value=True)
+    panic_minutes_threshold = st.number_input("Panic exit if minutes left <=", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
 
     st.divider()
     st.header("🕐 Trading Hours")
@@ -728,6 +735,7 @@ with c1:
                     auto_client = KalshiClient(key_id, private_key_text, demo_mode)
                     bal_data = auto_client.get_balance()
                     total_cents = int(bal_data.get("balance", 0))
+                    st.session_state.starting_live_balance = D(total_cents) / D(100)
                     
                     if "KXBTC" in series_ticker.upper() or "CRYPTO" in series_ticker.upper():
                         target_shard = 2
@@ -740,7 +748,7 @@ with c1:
 
             st.session_state.running = True
             st.session_state.emergency_stop = False
-            log(f"Bot started in turbo memory mode ({trading_mode}).")
+            log(f"Bot started with Live P/L tracking ({trading_mode}).")
             st.rerun()
 
 with c2:
@@ -823,7 +831,11 @@ def run_bot_cycle(client, daily_spent):
 
     if position["contracts"] > 0:
         try:
-            exited = manage_position(client, trading_mode, position, avg_entry, take_profit_pct, stop_loss_pct)
+            exited = manage_position(
+                client, trading_mode, position, avg_entry, 
+                take_profit_pct, stop_loss_pct, 
+                enable_panic_exit, panic_minutes_threshold
+            )
             if exited:
                 st.session_state.last_trade_time = now_utc()
                 return
@@ -876,10 +888,12 @@ def run_bot_cycle(client, daily_spent):
 
 @st.fragment(run_every=1)
 def render_dashboard_and_tick():
-    st.subheader("Dashboard & Zero-Lag Memory Scanner")
+    st.subheader("Dashboard & Live P/L Scanner")
     
     client = None
     daily_spent = ZERO
+    live_bal = ZERO
+    live_pnl = ZERO
     
     if key_id and private_key_text:
         try:
@@ -891,6 +905,15 @@ def render_dashboard_and_tick():
                 st.rerun()
 
     if client:
+        try:
+            bal_data = client.get_balance()
+            live_bal = D(bal_data.get("balance", 0)) / D(100)
+            if st.session_state.starting_live_balance is None:
+                st.session_state.starting_live_balance = live_bal
+            live_pnl = live_bal - st.session_state.starting_live_balance
+        except Exception:
+            pass
+
         try:
             res = client.get_markets(series_ticker=series_ticker, limit=10)
             markets = res.get("markets", [])
@@ -932,17 +955,11 @@ def render_dashboard_and_tick():
         if trading_mode == "PAPER TRADING":
             st.metric("Realized P/L", f"${st.session_state.paper_realized_pnl:.2f}")
         else:
-            st.metric("Daily Spent", f"${daily_spent:.2f}")
+            st.metric("Live P/L", f"${live_pnl:.2f}")
     with c_dash3:
         if trading_mode == "PAPER TRADING":
             st.metric("Unrealized P/L", f"${paper_unrealized:.2f}")
         else:
-            live_bal = 0
-            if client:
-                try:
-                    bal_data = client.get_balance()
-                    live_bal = D(bal_data.get("balance", 0)) / D(100)
-                except: pass
             st.metric("Live Balance", f"${live_bal:.2f}")
     with c_dash4:
         st.metric("Active Market", st.session_state.active_ticker or "--")
@@ -956,7 +973,6 @@ def render_dashboard_and_tick():
     elif not st.session_state.running:
         st.info("Bot is stopped. Choose your settings and press 'START AUTOTRADING'.")
 
-    # Smooth, lightweight chart rendering using stored historical memory
     if len(st.session_state.price_history) > 1:
         st.subheader("📈 Smooth Historical Price Momentum (Memory Buffer)")
         st.line_chart(st.session_state.price_history, height=200)
