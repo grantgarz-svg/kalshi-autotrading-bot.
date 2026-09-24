@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with defensive filters")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with API Diagnostics")
 
 
 # ============================================================
@@ -270,7 +270,6 @@ def market_minutes_remaining(market):
 
 
 def get_live_ask_price(client, ticker, outcome_to_trade):
-    """Gets the best ASK price (what you pay to enter/BUY)"""
     try:
         res = client.get_orderbook(ticker)
         ob = res.get("orderbook_fp") or res.get("orderbook") or res
@@ -296,7 +295,6 @@ def get_live_ask_price(client, ticker, outcome_to_trade):
 
 
 def get_live_bid_price(client, ticker, outcome_to_trade):
-    """Gets the best BID price (what you receive when you exit/SELL for TP/SL)"""
     try:
         res = client.get_orderbook(ticker)
         ob = res.get("orderbook_fp") or res.get("orderbook") or res
@@ -732,6 +730,32 @@ with st.sidebar:
     st.divider()
     manage_existing = st.checkbox("Manage existing position for TP/SL", value=False)
 
+    st.divider()
+    st.header("🛠️ API Diagnostics")
+    st.caption("Force the API to show its internal balance ledger.")
+    
+    if key_id and private_key_text:
+        if st.button("🔍 Check Raw API Balance", use_container_width=True):
+            try:
+                diag_client = KalshiClient(key_id, private_key_text, demo_mode)
+                with st.expander("API Balance Response", expanded=True):
+                    st.json(diag_client.get_balance())
+            except Exception as e:
+                st.error(f"Diagnostics Error: {e}")
+                
+        if st.button("🧹 Cancel All Resting Orders", use_container_width=True, type="secondary"):
+            try:
+                diag_client = KalshiClient(key_id, private_key_text, demo_mode)
+                orders_resp = diag_client.get_orders(status="resting")
+                orders = orders_resp.get("orders", [])
+                count = 0
+                for o in orders:
+                    diag_client.cancel_order(o.get("order_id"))
+                    count += 1
+                st.success(f"Successfully sent cancel signal to {count} resting orders.")
+            except Exception as e:
+                st.error(f"Cancellation Error: {e}")
+
 
 # ============================================================
 # SAFETY GATE
@@ -923,7 +947,7 @@ def run_bot_cycle(client, daily_spent):
                 error_str = str(e).lower()
                 log(f"Order submission error exception caught: {e}")
                 if "insufficient balance" in error_str or "insufficient_balance" in error_str:
-                    log("🛑 STOPPING BOT: Insufficient balance. Please deposit funds or switch to Paper Trading.")
+                    log("🛑 STOPPING BOT: Insufficient balance. Please check your API Diagnostics panel.")
                     st.session_state.emergency_stop = True
                     st.session_state.running = False
                     st.rerun()
