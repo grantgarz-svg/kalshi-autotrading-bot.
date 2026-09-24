@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with Dual-Direction Scans")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with Independent UP/DOWN Sliders")
 
 
 # ============================================================
@@ -278,23 +278,12 @@ def market_minutes_remaining(market):
 
 
 def get_both_prices(client, ticker):
-    """Fetches both YES and NO Asks and Bids for dual-direction scanning"""
     try:
         res = client.get_orderbook(ticker)
         ob = res.get("orderbook_fp") or res.get("orderbook") or res
         yes_levels = ob.get("yes_dollars") or ob.get("yes") or []
         no_levels = ob.get("no_dollars") or ob.get("no") or []
         
-        def extract_best(levels):
-            if not levels: return 0, 0
-            lvl = levels[-1] 
-            if isinstance(lvl, (list, tuple)): 
-                return int(float(lvl[0]) * 100), 0
-            if isinstance(lvl, dict): 
-                return int(float(lvl.get("price", 0)) * 100), 0
-            return 0, 0
-
-        # Note: Orderbook arrays usually store bids. Best bid for YES and NO:
         def extract_best_bid(levels):
             if not levels: return 0
             lvl = levels[-1]
@@ -313,7 +302,7 @@ def get_both_prices(client, ticker):
         return None
 
 
-def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, outcome_mode="YES"):
+def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, outcome_mode="YES", min_up=15, max_up=65, min_down=15, max_down=65):
     markets = []
     try:
         res = client.get_markets(series_ticker=series_ticker, limit=100)
@@ -358,16 +347,16 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
             if not prices:
                 continue
             
-            if outcome_mode == "BOTH":
-                # Check which side has liquidity
-                for side in ["YES", "NO"]:
-                    ask = prices[side]["ask"]
-                    if 0 < ask < 100:
-                        return m, side, ask
-            else:
-                ask = prices[outcome_mode]["ask"]
-                if 0 < ask < 100:
-                    return m, outcome_mode, ask
+            if outcome_mode in ["YES", "BOTH"]:
+                ask_up = prices["YES"]["ask"]
+                if min_up <= ask_up <= max_up:
+                    return m, "YES", ask_up
+
+            if outcome_mode in ["NO", "BOTH"]:
+                ask_down = prices["NO"]["ask"]
+                if min_down <= ask_down <= max_down:
+                    return m, "NO", ask_down
+
             time.sleep(0.1)
 
     return None, None, 0
@@ -517,9 +506,6 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
     
     st.session_state.last_client_order_id = client_order_id
 
-    # ==========================================
-    # PAPER TRADING LEDGER & PNL CALCULATIONS
-    # ==========================================
     if mode == "PAPER TRADING":
         contracts_d = D(contracts)
         price_d = D(outcome_cents) / D(100)
@@ -560,9 +546,6 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
             "fill_count": D(contracts), "remaining_count": ZERO, "status": "paper_fill",
         }
 
-    # ==========================================
-    # LIVE TRADING EXECUTION
-    # ==========================================
     try:
         response = client.create_v2_order(
             ticker=ticker, client_order_id=client_order_id, book_side=book_side,
@@ -711,11 +694,25 @@ with st.sidebar:
     max_dollars_trade = st.number_input("Maximum dollars per trade", min_value=0.01, max_value=10000.00, value=10.00, step=1.00)
     daily_cap = st.number_input("Daily spending cap", min_value=0.01, max_value=100000.00, value=100.00, step=5.00)
     
-    c_entry1, c_entry2 = st.columns(2)
-    with c_entry1:
-        min_entry = st.slider("Min entry price", min_value=1, max_value=99, value=15, format="%d¢")
-    with c_entry2:
-        max_entry = st.slider("Max entry price", min_value=1, max_value=99, value=65, format="%d¢")
+    # Independent sliders based on outcome selection
+    min_entry_up, max_entry_up = 15, 65
+    min_entry_down, max_entry_down = 15, 65
+
+    if display_outcome in ["UP", "BOTH (UP & DOWN)"]:
+        st.subheader("🟢 UP (YES) Entry Limits")
+        c1, c2 = st.columns(2)
+        with c1:
+            min_entry_up = st.slider("Min UP", 1, 99, 15, format="%d¢", key="min_up")
+        with c2:
+            max_entry_up = st.slider("Max UP", 1, 99, 65, format="%d¢", key="max_up")
+
+    if display_outcome in ["DOWN", "BOTH (UP & DOWN)"]:
+        st.subheader("🔴 DOWN (NO) Entry Limits")
+        c3, c4 = st.columns(2)
+        with c3:
+            min_entry_down = st.slider("Min DOWN", 1, 99, 15, format="%d¢", key="min_down")
+        with c4:
+            max_entry_down = st.slider("Max DOWN", 1, 99, 65, format="%d¢", key="max_down")
         
     max_spread = st.slider("Max Bid/Ask Spread", min_value=1, max_value=50, value=5, format="%d¢")
     cooldown = st.slider("Cooldown between entries", min_value=10, max_value=1800, value=60, step=10, format="%d seconds")
@@ -846,7 +843,10 @@ def run_bot_cycle(client, daily_spent):
 
     try:
         market, found_outcome, entry_price = find_active_market_with_liquidity(
-            client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), outcome_mode=outcome_mode
+            client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), 
+            outcome_mode=outcome_mode, 
+            min_up=min_entry_up, max_up=max_entry_up, 
+            min_down=min_entry_down, max_down=max_entry_down
         )
 
         if not market or entry_price <= 0 or entry_price >= 100:
@@ -916,9 +916,13 @@ def run_bot_cycle(client, daily_spent):
     live_bid = prices[found_outcome]["bid"]
     spread = entry_price - live_bid
 
-    if not (min_entry <= entry_price <= max_entry):
+    # Enforce correct outcome bounds
+    cur_min = min_entry_up if found_outcome == "YES" else min_entry_down
+    cur_max = max_entry_up if found_outcome == "YES" else max_entry_down
+
+    if not (cur_min <= entry_price <= cur_max):
         signal = False
-        log_once("limits", f"{ticker} [{found_outcome}]: Ask {entry_price}¢ outside limits ({min_entry}¢-{max_entry}¢).")
+        log_once("limits", f"{ticker} [{found_outcome}]: Ask {entry_price}¢ outside limits ({cur_min}¢-{cur_max}¢).")
     elif spread > max_spread:
         signal = False
         log_once("spread_abs", f"{ticker} [{found_outcome}]: Spread {spread}¢ exceeds absolute max {max_spread}¢.")
