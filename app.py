@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with Dashboard UP/DOWN Ask Metrics")
+st.caption("Production-hardened live Kalshi trading dashboard with Graceful Balance Handling")
 
 
 # ============================================================
@@ -351,7 +351,6 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
             ask_up = prices["YES"]["ask"]
             ask_down = prices["NO"]["ask"]
             
-            # Store in session state for dashboard metrics display
             st.session_state.active_ticker = t
             st.session_state.up_ask_display = f"{ask_up}¢" if ask_up > 0 else "--"
             st.session_state.down_ask_display = f"{ask_down}¢" if ask_down > 0 else "--"
@@ -698,7 +697,7 @@ with st.sidebar:
 
     st.divider()
     st.header("💰 Risk Settings")
-    max_dollars_trade = st.number_input("Maximum dollars per trade", min_value=0.01, max_value=10000.00, value=10.00, step=1.00)
+    max_dollars_trade = st.number_input("Maximum dollars per trade", min_value=0.01, max_value=10000.00, value=2.00, step=0.50)
     daily_cap = st.number_input("Daily spending cap", min_value=0.01, max_value=100000.00, value=100.00, step=5.00)
     
     min_entry_up, max_entry_up = 15, 65
@@ -721,7 +720,7 @@ with st.sidebar:
             max_entry_down = st.slider("Max DOWN", 1, 99, 65, format="%d¢", key="max_down")
         
     max_spread = st.slider("Max Bid/Ask Spread", min_value=1, max_value=50, value=5, format="%d¢")
-    cooldown = st.slider("Cooldown between entries", min_value=10, max_value=1800, value=30, step=5, format="%d seconds")
+    cooldown = st.slider("Cooldown between entries", min_value=10, max_value=1800, value=45, step=5, format="%d seconds")
     min_minutes_to_expiry = st.number_input("Do not enter if expiration is closer than", min_value=0.0, max_value=120.0, value=2.0, step=0.5)
     take_profit_pct = st.number_input("Take profit %", min_value=0.0, max_value=500.0, value=20.0, step=1.0)
     stop_loss_pct = st.number_input("Stop loss %", min_value=0.0, max_value=99.0, value=25.0, step=1.0)
@@ -771,7 +770,7 @@ with c1:
                     target_shard = 2 if "KXBTC" in series_ticker.upper() or "CRYPTO" in series_ticker.upper() else 0
                     auto_client.set_target_allocation(exchange_index=target_shard, percent=100)
                     log(f"⚡ Automatically routed 100% balance to Shard {target_shard} for {series_ticker}")
-                    time.sleep(1)
+                    time.sleep(1.5)
                 except Exception as e:
                     log(f"⚠️ Auto-shard routing note: {e}")
 
@@ -844,9 +843,6 @@ def run_bot_cycle(client, daily_spent):
     if pos_key in st.session_state.blacklisted_tickers:
         return
 
-    # ==========================================
-    # POSITIONS ROUTING
-    # ==========================================
     position = {"contracts": ZERO}
     avg_entry = None
 
@@ -865,9 +861,6 @@ def run_bot_cycle(client, daily_spent):
         position = {"ticker": ticker, "outcome": found_outcome, "contracts": p_pos["contracts"]}
         avg_entry = p_pos["avg_cost"] if p_pos["contracts"] > 0 else None
 
-    # ==========================================
-    # TP / SL MANAGEMENT
-    # ==========================================
     if position["contracts"] > 0:
         try:
             exited = manage_position(client, trading_mode, position, avg_entry, take_profit_pct, stop_loss_pct)
@@ -878,18 +871,12 @@ def run_bot_cycle(client, daily_spent):
             error_str = str(error).lower()
             log(f"TP/SL error: {error}")
             if "insufficient balance" in error_str or "insufficient_balance" in error_str:
-                log("🛑 STOPPING BOT: Insufficient balance on TP/SL.")
-                st.session_state.emergency_stop = True
-                st.session_state.running = False
-                st.rerun()
+                log("⚠️ Insufficient balance on TP/SL. Skipping cycle...")
                 return
 
     if position["contracts"] > 0:
         return
 
-    # ==========================================
-    # ENTRY LOGIC & DEFENSIVE FILTERS
-    # ==========================================
     signal = True
     prices = get_both_prices(client, ticker)
     if not prices: return
@@ -941,12 +928,11 @@ def run_bot_cycle(client, daily_spent):
                     st.session_state.bot_positions[pos_key] = {"outcome": found_outcome, "contracts": str(contracts)}
             except Exception as e:
                 error_str = str(e).lower()
-                log(f"Order submission error exception caught: {e}")
+                log(f"Order error caught: {e}")
                 if "insufficient balance" in error_str or "insufficient_balance" in error_str:
-                    log("🛑 STOPPING BOT: Insufficient balance. Check funds in Kalshi app.")
-                    st.session_state.emergency_stop = True
-                    st.session_state.running = False
-                    st.rerun()
+                    # GRACEFUL RECOVERY: Do not stop the bot! Just log and wait for next cycle.
+                    log("⚠️ Insufficient live balance for this order size. Waiting for collateral to settle...")
+                    time.sleep(3)
 
 
 @st.fragment(run_every=3)
@@ -965,7 +951,6 @@ def render_dashboard_and_tick():
                 st.session_state.running = False
                 st.rerun()
 
-    # Continuously poll live market prices for the dashboard metrics even when paused
     if client:
         try:
             res = client.get_markets(series_ticker=series_ticker, limit=20)
@@ -1001,7 +986,6 @@ def render_dashboard_and_tick():
                         current_val = D(current_bid_cents) / D(100)
                         paper_unrealized += (current_val - p_data["avg_cost"]) * p_data["contracts"]
 
-    # 6-Column Dashboard Metric Display featuring UP Ask and DOWN Ask
     c_dash1, c_dash2, c_dash3, c_dash4, c_dash5, c_dash6 = st.columns(6)
     with c_dash1:
         st.metric("Mode", trading_mode)
