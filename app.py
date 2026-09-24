@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with Shard Rebalancer")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with Dual-Direction Scans")
 
 
 # ============================================================
@@ -277,7 +277,8 @@ def market_minutes_remaining(market):
     return (close - now_utc()).total_seconds() / 60
 
 
-def get_live_ask_price(client, ticker, outcome_to_trade):
+def get_both_prices(client, ticker):
+    """Fetches both YES and NO Asks and Bids for dual-direction scanning"""
     try:
         res = client.get_orderbook(ticker)
         ob = res.get("orderbook_fp") or res.get("orderbook") or res
@@ -285,46 +286,34 @@ def get_live_ask_price(client, ticker, outcome_to_trade):
         no_levels = ob.get("no_dollars") or ob.get("no") or []
         
         def extract_best(levels):
-            if not levels: return 0
+            if not levels: return 0, 0
             lvl = levels[-1] 
-            if isinstance(lvl, (list, tuple)): return int(float(lvl[0]) * 100) 
+            if isinstance(lvl, (list, tuple)): 
+                return int(float(lvl[0]) * 100), 0
+            if isinstance(lvl, dict): 
+                return int(float(lvl.get("price", 0)) * 100), 0
+            return 0, 0
+
+        # Note: Orderbook arrays usually store bids. Best bid for YES and NO:
+        def extract_best_bid(levels):
+            if not levels: return 0
+            lvl = levels[-1]
+            if isinstance(lvl, (list, tuple)): return int(float(lvl[0]) * 100)
             if isinstance(lvl, dict): return int(float(lvl.get("price", 0)) * 100)
             return 0
 
-        yes_bid = extract_best(yes_levels)
-        no_bid = extract_best(no_levels)
+        yes_bid = extract_best_bid(yes_levels)
+        no_bid = extract_best_bid(no_levels)
         
         yes_ask = (100 - no_bid) if no_bid > 0 else 0
         no_ask = (100 - yes_bid) if yes_bid > 0 else 0
 
-        return yes_ask if outcome_to_trade == "YES" else no_ask
+        return {"YES": {"ask": yes_ask, "bid": yes_bid}, "NO": {"ask": no_ask, "bid": no_bid}}
     except Exception as e:
-        return 0
+        return None
 
 
-def get_live_bid_price(client, ticker, outcome_to_trade):
-    try:
-        res = client.get_orderbook(ticker)
-        ob = res.get("orderbook_fp") or res.get("orderbook") or res
-        yes_levels = ob.get("yes_dollars") or ob.get("yes") or []
-        no_levels = ob.get("no_dollars") or ob.get("no") or []
-        
-        def extract_best(levels):
-            if not levels: return 0
-            lvl = levels[-1] 
-            if isinstance(lvl, (list, tuple)): return int(float(lvl[0]) * 100) 
-            if isinstance(lvl, dict): return int(float(lvl.get("price", 0)) * 100)
-            return 0
-
-        yes_bid = extract_best(yes_levels)
-        no_bid = extract_best(no_levels)
-
-        return yes_bid if outcome_to_trade == "YES" else no_bid
-    except Exception as e:
-        return 0
-
-
-def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, outcome_to_trade="YES"):
+def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, outcome_mode="YES"):
     markets = []
     try:
         res = client.get_markets(series_ticker=series_ticker, limit=100)
@@ -347,7 +336,7 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         valid_markets = [m for m in open_markets if market_minutes_remaining(m) is not None and market_minutes_remaining(m) > 0]
 
     if not valid_markets:
-        return None, 0
+        return None, None, 0
 
     windows = {}
     for m in valid_markets:
@@ -363,26 +352,25 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         current_window = windows[w_key]
         current_window.sort(key=lambda x: x.get("ticker", ""))
         
-        if current_window:
-            mid_idx = len(current_window) // 2
-            atm_market = current_window[mid_idx]
+        for m in current_window:
+            t = m.get("ticker")
+            prices = get_both_prices(client, t)
+            if not prices:
+                continue
             
-            ask = get_live_ask_price(client, atm_market.get("ticker"), outcome_to_trade)
-            if 0 < ask < 100:
-                return atm_market, ask
-                
+            if outcome_mode == "BOTH":
+                # Check which side has liquidity
+                for side in ["YES", "NO"]:
+                    ask = prices[side]["ask"]
+                    if 0 < ask < 100:
+                        return m, side, ask
+            else:
+                ask = prices[outcome_mode]["ask"]
+                if 0 < ask < 100:
+                    return m, outcome_mode, ask
             time.sleep(0.1)
 
-            for m in current_window:
-                if m == atm_market:
-                    continue
-                t = m.get("ticker")
-                ask = get_live_ask_price(client, t, outcome_to_trade)
-                if 0 < ask < 100:
-                    return m, ask
-                time.sleep(0.1)
-
-    return None, 0
+    return None, None, 0
 
 
 def outcome_to_book_side(outcome, action):
@@ -398,7 +386,7 @@ def outcome_price_to_book_price(outcome, action, outcome_cents):
     return D(1) - p
 
 
-def extract_position(positions_response, ticker):
+def extract_position(positions_response, ticker, outcome_target=None):
     rows = positions_response.get("market_positions", [])
     for row in rows:
         row_ticker = row.get("ticker") or row.get("market_ticker")
@@ -407,10 +395,11 @@ def extract_position(positions_response, ticker):
         raw = row.get("position_fp") if row.get("position_fp") is not None else row.get("position")
         position = D(raw)
         if position > 0:
+            if outcome_target and outcome_target != "YES": continue
             return {"ticker": ticker, "outcome": "YES", "contracts": position}
         if position < 0:
+            if outcome_target and outcome_target != "NO": continue
             return {"ticker": ticker, "outcome": "NO", "contracts": abs(position)}
-        return {"ticker": ticker, "outcome": None, "contracts": ZERO}
     return {"ticker": ticker, "outcome": None, "contracts": ZERO}
 
 
@@ -535,10 +524,11 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
         contracts_d = D(contracts)
         price_d = D(outcome_cents) / D(100)
         
-        if ticker not in st.session_state.paper_positions:
-            st.session_state.paper_positions[ticker] = {"contracts": ZERO, "avg_cost": ZERO, "outcome": outcome}
+        pos_key = f"{ticker}_{outcome}"
+        if pos_key not in st.session_state.paper_positions:
+            st.session_state.paper_positions[pos_key] = {"contracts": ZERO, "avg_cost": ZERO, "ticker": ticker, "outcome": outcome}
             
-        pos = st.session_state.paper_positions[ticker]
+        pos = st.session_state.paper_positions[pos_key]
 
         if action == "BUY":
             total_current_cost = pos["contracts"] * pos["avg_cost"]
@@ -553,7 +543,7 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
                 pos["contracts"] = ZERO
                 pos["avg_cost"] = ZERO
 
-        st.session_state.paper_positions[ticker] = pos
+        st.session_state.paper_positions[pos_key] = pos
 
         log(f"📝 PAPER {action} {contracts} {outcome} {ticker} @ {outcome_cents}¢")
         st.session_state.paper_trades.append({
@@ -652,7 +642,9 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
         return False
 
     try:
-        current_bid = get_live_bid_price(client, ticker, outcome)
+        prices = get_both_prices(client, ticker)
+        if not prices: return False
+        current_bid = prices[outcome]["bid"]
         if current_bid <= 0:
             return False
     except Exception as error:
@@ -682,7 +674,7 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
         log(f"{reason} exit confirmation: filled={filled}, remaining={remaining}, status={status}")
 
     if reason == "STOP LOSS":
-        st.session_state.blacklisted_tickers.add(ticker)
+        st.session_state.blacklisted_tickers.add(f"{ticker}_{outcome}")
         st.session_state["last_status_log"] = None 
 
     return True
@@ -706,8 +698,13 @@ with st.sidebar:
     st.divider()
     st.header("📊 Market")
     series_ticker = st.text_input("Market Series", value="KXBTC15M")
-    display_outcome = st.selectbox("Entry outcome", ["UP", "DOWN"])
-    outcome_to_trade = "YES" if display_outcome == "UP" else "NO"
+    display_outcome = st.selectbox("Entry outcome", ["UP", "DOWN", "BOTH (UP & DOWN)"])
+    if display_outcome == "UP":
+        outcome_mode = "YES"
+    elif display_outcome == "DOWN":
+        outcome_mode = "NO"
+    else:
+        outcome_mode = "BOTH"
 
     st.divider()
     st.header("💰 Risk Settings")
@@ -848,8 +845,8 @@ def run_bot_cycle(client, daily_spent):
         return
 
     try:
-        market, entry_price = find_active_market_with_liquidity(
-            client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), outcome_to_trade=outcome_to_trade
+        market, found_outcome, entry_price = find_active_market_with_liquidity(
+            client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), outcome_mode=outcome_mode
         )
 
         if not market or entry_price <= 0 or entry_price >= 100:
@@ -857,34 +854,41 @@ def run_bot_cycle(client, daily_spent):
             return
 
         ticker = market.get("ticker")
-        st.session_state.active_ticker = ticker
+        st.session_state.active_ticker = f"{ticker} [{found_outcome}]"
         st.session_state.last_price = entry_price
     except Exception as error:
         log_once("discovery_err", f"Market discovery error: {error}")
         return
 
-    if ticker in st.session_state.blacklisted_tickers:
+    pos_key = f"{ticker}_{found_outcome}"
+    if pos_key in st.session_state.blacklisted_tickers:
         return
 
+    # ==========================================
+    # POSITIONS ROUTING
+    # ==========================================
     position = {"contracts": ZERO}
     avg_entry = None
 
     if trading_mode == "LIVE TRADING":
         try:
             position_response = client.get_positions(ticker=ticker)
-            position = extract_position(position_response, ticker)
+            position = extract_position(position_response, ticker, outcome_target=found_outcome)
             fills_response = client.get_fills(ticker=ticker)
             fills = fills_response.get("fills", [])
-            avg_entry = reconstruct_average_entry(fills, ticker, outcome_to_trade)
+            avg_entry = reconstruct_average_entry(fills, ticker, found_outcome)
         except Exception as error:
             log_once("pos_err", f"Position/fill error: {error}")
             return
     else:
-        p_pos = st.session_state.paper_positions.get(ticker, {"contracts": ZERO, "avg_cost": ZERO, "outcome": outcome_to_trade})
-        position = {"ticker": ticker, "outcome": outcome_to_trade, "contracts": p_pos["contracts"]}
+        p_pos = st.session_state.paper_positions.get(pos_key, {"contracts": ZERO, "avg_cost": ZERO, "outcome": found_outcome})
+        position = {"ticker": ticker, "outcome": found_outcome, "contracts": p_pos["contracts"]}
         avg_entry = p_pos["avg_cost"] if p_pos["contracts"] > 0 else None
 
-    if position["contracts"] > 0 and (manage_existing or ticker in st.session_state.bot_positions):
+    # ==========================================
+    # TP / SL MANAGEMENT
+    # ==========================================
+    if position["contracts"] > 0:
         try:
             exited = manage_position(client, trading_mode, position, avg_entry, take_profit_pct, stop_loss_pct)
             if exited:
@@ -900,28 +904,32 @@ def run_bot_cycle(client, daily_spent):
                 st.rerun()
                 return
 
-    already_in_target_position = (position["contracts"] > 0 and position["outcome"] == outcome_to_trade)
-    if already_in_target_position:
+    if position["contracts"] > 0:
         return
 
+    # ==========================================
+    # ENTRY LOGIC & DEFENSIVE FILTERS
+    # ==========================================
     signal = True
-    live_bid = get_live_bid_price(client, ticker, outcome_to_trade)
+    prices = get_both_prices(client, ticker)
+    if not prices: return
+    live_bid = prices[found_outcome]["bid"]
     spread = entry_price - live_bid
 
     if not (min_entry <= entry_price <= max_entry):
         signal = False
-        log_once("limits", f"{ticker}: Ask {entry_price}¢ outside limits ({min_entry}¢-{max_entry}¢).")
+        log_once("limits", f"{ticker} [{found_outcome}]: Ask {entry_price}¢ outside limits ({min_entry}¢-{max_entry}¢).")
     elif spread > max_spread:
         signal = False
-        log_once("spread_abs", f"{ticker}: Spread {spread}¢ exceeds absolute max {max_spread}¢. Ask:{entry_price}¢ Bid:{live_bid}¢.")
+        log_once("spread_abs", f"{ticker} [{found_outcome}]: Spread {spread}¢ exceeds absolute max {max_spread}¢.")
     elif live_bid <= (entry_price * (1 - stop_loss_pct / 100)):
         signal = False
-        log_once("spread_sl", f"{ticker}: Bid ({live_bid}¢) is too low. Would instantly trigger {stop_loss_pct}% Stop Loss.")
+        log_once("spread_sl", f"{ticker} [{found_outcome}]: Bid ({live_bid}¢) is too low. Would instantly trigger Stop Loss.")
     elif st.session_state.last_trade_time:
         elapsed = (now_utc() - st.session_state.last_trade_time).total_seconds()
         if elapsed < cooldown:
             signal = False
-            log_once("cooldown", f"{ticker}: Cooldown active ({int(cooldown - elapsed)}s remaining).")
+            log_once("cooldown", f"Cooldown active ({int(cooldown - elapsed)}s remaining).")
 
     if signal:
         st.session_state["last_status_log"] = None
@@ -932,11 +940,11 @@ def run_bot_cycle(client, daily_spent):
             log_once("blocked", "Entry blocked: daily cap or trade limit does not allow even one contract.")
         else:
             estimated_cost = D(contracts) * D(entry_price) / D(100)
-            log(f"ENTRY SIGNAL: BUY {contracts} {outcome_to_trade} {ticker} @ {entry_price}¢ (~${estimated_cost:.2f})")
+            log(f"ENTRY SIGNAL: BUY {contracts} {found_outcome} {ticker} @ {entry_price}¢ (~${estimated_cost:.2f})")
 
             try:
                 result = submit_trade(
-                    client=client, mode=trading_mode, ticker=ticker, outcome=outcome_to_trade,
+                    client=client, mode=trading_mode, ticker=ticker, outcome=found_outcome,
                     action="BUY", contracts=contracts, outcome_cents=entry_price, reduce_only=False,
                 )
                 st.session_state.last_trade_time = now_utc()
@@ -945,9 +953,9 @@ def run_bot_cycle(client, daily_spent):
                     filled, remaining, status = confirm_fill(client, result.get("order_id"))
                     st.session_state.last_fill_count = filled
                     if filled > 0:
-                        st.session_state.bot_positions[ticker] = {"outcome": outcome_to_trade, "contracts": str(filled)}
+                        st.session_state.bot_positions[pos_key] = {"outcome": found_outcome, "contracts": str(filled)}
                 else:
-                    st.session_state.bot_positions[ticker] = {"outcome": outcome_to_trade, "contracts": str(contracts)}
+                    st.session_state.bot_positions[pos_key] = {"outcome": found_outcome, "contracts": str(contracts)}
             except Exception as e:
                 error_str = str(e).lower()
                 log(f"Order submission error exception caught: {e}")
@@ -984,12 +992,14 @@ def render_dashboard_and_tick():
 
     paper_unrealized = ZERO
     if client and trading_mode == "PAPER TRADING":
-        for t, p_data in st.session_state.paper_positions.items():
+        for pk, p_data in st.session_state.paper_positions.items():
             if p_data["contracts"] > 0:
-                current_bid_cents = get_live_bid_price(client, t, p_data["outcome"])
-                if current_bid_cents > 0:
-                    current_val = D(current_bid_cents) / D(100)
-                    paper_unrealized += (current_val - p_data["avg_cost"]) * p_data["contracts"]
+                prices = get_both_prices(client, p_data["ticker"])
+                if prices:
+                    current_bid_cents = prices[p_data["outcome"]]["bid"]
+                    if current_bid_cents > 0:
+                        current_val = D(current_bid_cents) / D(100)
+                        paper_unrealized += (current_val - p_data["avg_cost"]) * p_data["contracts"]
 
     c_dash1, c_dash2, c_dash3, c_dash4, c_dash5, c_dash6 = st.columns(6)
     with c_dash1:
@@ -1029,10 +1039,10 @@ def render_dashboard_and_tick():
     if trading_mode == "PAPER TRADING" and any(p["contracts"] > 0 for p in st.session_state.paper_positions.values()):
         st.subheader("💼 Active Paper Positions")
         active_pos_list = []
-        for t, p_data in st.session_state.paper_positions.items():
+        for pk, p_data in st.session_state.paper_positions.items():
             if p_data["contracts"] > 0:
                 active_pos_list.append({
-                    "Ticker": t,
+                    "Ticker": p_data["ticker"],
                     "Outcome": p_data["outcome"],
                     "Contracts": p_data["contracts"],
                     "Avg Entry": f"${p_data['avg_cost']:.4f}",
