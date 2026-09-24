@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with Auto-Shard Routing")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with Dashboard UP/DOWN Ask Metrics")
 
 
 # ============================================================
@@ -57,8 +57,9 @@ DEFAULTS = {
     "paper_positions": {},      
     "paper_realized_pnl": ZERO, 
     "last_trade_time": None,
-    "last_price": None,
     "active_ticker": None,
+    "up_ask_display": "--",
+    "down_ask_display": "--",
     "last_order_id": None,
     "last_client_order_id": None,
     "last_fill_count": ZERO,
@@ -350,7 +351,10 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
             ask_up = prices["YES"]["ask"]
             ask_down = prices["NO"]["ask"]
             
-            log_once(f"scan_{t}", f"Scanning {t} | UP Ask: {ask_up}¢ | DOWN Ask: {ask_down}¢")
+            # Store in session state for dashboard metrics display
+            st.session_state.active_ticker = t
+            st.session_state.up_ask_display = f"{ask_up}¢" if ask_up > 0 else "--"
+            st.session_state.down_ask_display = f"{ask_down}¢" if ask_down > 0 else "--"
 
             if outcome_mode in ["YES", "BOTH"]:
                 if min_up <= ask_up <= max_up:
@@ -761,11 +765,9 @@ with c1:
         elif trading_mode == "LIVE TRADING" and not live_confirmed:
             st.error("Live confirmation required.")
         else:
-            # AUTOMATICALLY ROUTE FUNDS TO CORRECT SHARD ON START
             if trading_mode == "LIVE TRADING":
                 try:
                     auto_client = KalshiClient(key_id, private_key_text, demo_mode)
-                    # Crypto series uses Shard 2; standard markets use Shard 0
                     target_shard = 2 if "KXBTC" in series_ticker.upper() or "CRYPTO" in series_ticker.upper() else 0
                     auto_client.set_target_allocation(exchange_index=target_shard, percent=100)
                     log(f"⚡ Automatically routed 100% balance to Shard {target_shard} for {series_ticker}")
@@ -834,8 +836,6 @@ def run_bot_cycle(client, daily_spent):
             return
 
         ticker = market.get("ticker")
-        st.session_state.active_ticker = f"{ticker} [{found_outcome}]"
-        st.session_state.last_price = entry_price
     except Exception as error:
         log_once("discovery_err", f"Market discovery error: {error}")
         return
@@ -965,6 +965,23 @@ def render_dashboard_and_tick():
                 st.session_state.running = False
                 st.rerun()
 
+    # Continuously poll live market prices for the dashboard metrics even when paused
+    if client:
+        try:
+            res = client.get_markets(series_ticker=series_ticker, limit=20)
+            markets = res.get("markets", [])
+            open_markets = [m for m in markets if str(m.get("status", "")).lower() not in ("closed", "settled", "finalized")]
+            if open_markets:
+                open_markets.sort(key=lambda x: x.get("ticker", ""))
+                t_sample = open_markets[0].get("ticker")
+                p_sample = get_both_prices(client, t_sample)
+                if p_sample:
+                    st.session_state.active_ticker = t_sample
+                    st.session_state.up_ask_display = f"{p_sample['YES']['ask']}¢" if p_sample['YES']['ask'] > 0 else "--"
+                    st.session_state.down_ask_display = f"{p_sample['NO']['ask']}¢" if p_sample['NO']['ask'] > 0 else "--"
+        except Exception:
+            pass
+
     if client and trading_mode == "LIVE TRADING":
         try:
             daily_spent = calculate_daily_spend(client)
@@ -984,35 +1001,32 @@ def render_dashboard_and_tick():
                         current_val = D(current_bid_cents) / D(100)
                         paper_unrealized += (current_val - p_data["avg_cost"]) * p_data["contracts"]
 
+    # 6-Column Dashboard Metric Display featuring UP Ask and DOWN Ask
     c_dash1, c_dash2, c_dash3, c_dash4, c_dash5, c_dash6 = st.columns(6)
     with c_dash1:
         st.metric("Mode", trading_mode)
     with c_dash2:
-        st.metric("Daily Spent", f"${daily_spent:.2f}")
-
-    if trading_mode == "PAPER TRADING":
-        with c_dash3:
-            st.metric("Paper Realized P/L", f"${st.session_state.paper_realized_pnl:.2f}")
-        with c_dash4:
-            color = "normal" if paper_unrealized == 0 else ("inverse" if paper_unrealized < 0 else "normal")
-            st.metric("Paper Unrealized P/L", f"${paper_unrealized:.2f}", delta=f"${paper_unrealized:.2f}", delta_color=color)
-    else:
-        live_bal = 0
-        if client:
-            try:
-                bal_data = client.get_balance()
-                live_bal = D(bal_data.get("balance", 0)) / D(100)
-            except: pass
-        with c_dash3:
+        if trading_mode == "PAPER TRADING":
+            st.metric("Realized P/L", f"${st.session_state.paper_realized_pnl:.2f}")
+        else:
+            st.metric("Daily Spent", f"${daily_spent:.2f}")
+    with c_dash3:
+        if trading_mode == "PAPER TRADING":
+            st.metric("Unrealized P/L", f"${paper_unrealized:.2f}")
+        else:
+            live_bal = 0
+            if client:
+                try:
+                    bal_data = client.get_balance()
+                    live_bal = D(bal_data.get("balance", 0)) / D(100)
+                except: pass
             st.metric("Live Balance", f"${live_bal:.2f}")
-        with c_dash4:
-            st.metric("Live P/L", "Check Kalshi App")
-
+    with c_dash4:
+        st.metric("Active Market", st.session_state.active_ticker or "--")
     with c_dash5:
-        st.metric("Market", st.session_state.active_ticker or "--")
+        st.metric("🟢 UP Ask", st.session_state.up_ask_display)
     with c_dash6:
-        price_display = f"{st.session_state.last_price}¢" if st.session_state.last_price else "--"
-        st.metric("Ask Price", price_display)
+        st.metric("🔴 DOWN Ask", st.session_state.down_ask_display)
 
     if st.session_state.running and client:
         run_bot_cycle(client, daily_spent)
