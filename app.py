@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with Independent UP/DOWN Sliders")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with Dual Ask Price Visibility")
 
 
 # ============================================================
@@ -347,13 +347,17 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
             if not prices:
                 continue
             
+            ask_up = prices["YES"]["ask"]
+            ask_down = prices["NO"]["ask"]
+            
+            # Log current ask prices for both UP and DOWN for visibility
+            log_once(f"scan_{t}", f"Scanning {t} | UP Ask: {ask_up}¢ | DOWN Ask: {ask_down}¢")
+
             if outcome_mode in ["YES", "BOTH"]:
-                ask_up = prices["YES"]["ask"]
                 if min_up <= ask_up <= max_up:
                     return m, "YES", ask_up
 
             if outcome_mode in ["NO", "BOTH"]:
-                ask_down = prices["NO"]["ask"]
                 if min_down <= ask_down <= max_down:
                     return m, "NO", ask_down
 
