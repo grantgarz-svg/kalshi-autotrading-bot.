@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened live Kalshi trading dashboard with Automatic Shard Fund Transfer")
+st.caption("Production-hardened live Kalshi trading dashboard with Dedicated Buy/Sell Execution Log")
 
 
 # ============================================================
@@ -53,6 +53,7 @@ DEFAULTS = {
     "running": False,
     "emergency_stop": False,
     "logs": [],
+    "trade_logs": [],
     "paper_trades": [],
     "paper_positions": {},      
     "paper_realized_pnl": ZERO, 
@@ -540,15 +541,19 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
         st.session_state.paper_positions[pos_key] = pos
 
         log(f"📝 PAPER {action} {contracts} {outcome} {ticker} @ {outcome_cents}¢")
-        st.session_state.paper_trades.append({
+        trade_entry = {
             "Time": now_utc().strftime("%H:%M:%S"),
-            "Ticker": ticker,
-            "Outcome": outcome,
+            "Mode": mode,
             "Action": action,
+            "Outcome": outcome,
+            "Ticker": ticker,
             "Contracts": contracts,
             "Price": f"{outcome_cents}¢",
             "Cost/Value": f"${estimated_cost:.2f}",
-        })
+            "Status": "Filled"
+        }
+        st.session_state.trade_logs.append(trade_entry)
+        st.session_state.paper_trades.append(trade_entry)
         return {
             "order_id": "PAPER", "client_order_id": client_order_id,
             "fill_count": D(contracts), "remaining_count": ZERO, "status": "paper_fill",
@@ -577,6 +582,20 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
             "remaining_count": f"{remaining:.2f}", "status": status, "error": "",
         })
         log(f"🟢 LIVE ORDER {action}: {contracts} {outcome} {ticker} @ {outcome_cents}¢ | filled={fill_count_value}")
+        
+        # Add to separate execution log
+        st.session_state.trade_logs.append({
+            "Time": now_utc().strftime("%H:%M:%S"),
+            "Mode": mode,
+            "Action": action,
+            "Outcome": outcome,
+            "Ticker": ticker,
+            "Contracts": contracts,
+            "Price": f"{outcome_cents}¢",
+            "Cost/Value": f"${estimated_cost:.2f}",
+            "Status": status
+        })
+
         return {
             "order_id": order_id, "client_order_id": client_order_id,
             "fill_count": fill_count_value, "remaining_count": remaining, "status": status,
@@ -775,7 +794,6 @@ with c1:
                     if "KXBTC" in series_ticker.upper() or "CRYPTO" in series_ticker.upper():
                         target_shard = 2
                         if total_cents > 0:
-                            # Programmatically transfer full balance from Shard 0 to Crypto Shard 2
                             auto_client.intra_exchange_transfer(amount_cents=total_cents, source_shard=0, dest_shard=target_shard)
                             log(f"⚡ Automatically transferred {total_cents} cents from Shard 0 to Crypto Shard {target_shard}!")
                     else:
@@ -1042,15 +1060,20 @@ def render_dashboard_and_tick():
                 })
         st.dataframe(active_pos_list, use_container_width=True, hide_index=True)
 
+    # ==========================================
+    # DEDICATED EXECUTION LOG (BUYS & SELLS)
+    # ==========================================
+    st.subheader("🛒 Execution Log (Buys & Sells)")
+    if st.session_state.trade_logs:
+        st.dataframe(st.session_state.trade_logs, use_container_width=True, hide_index=True)
+    else:
+        st.info("No buys or sells executed yet this session.")
+
     st.subheader("📜 Bot Log")
     if st.session_state.logs:
         st.code("\n".join(st.session_state.logs[-30:]))
     else:
         st.info("Waiting for bot activity...")
-
-    if st.session_state.paper_trades:
-        st.subheader("📝 Paper Trades History")
-        st.dataframe(st.session_state.paper_trades, use_container_width=True, hide_index=True)
 
     if not st.session_state.running and LOG_FILE.exists():
         st.download_button(
