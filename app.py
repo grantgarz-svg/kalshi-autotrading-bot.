@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened paper/live Kalshi trading dashboard with API Diagnostics")
+st.caption("Production-hardened paper/live Kalshi trading dashboard with Shard Rebalancer")
 
 
 # ============================================================
@@ -202,6 +202,14 @@ class KalshiClient:
 
     def get_balance(self):
         return self.request("GET", "/portfolio/balance")
+
+    def set_target_allocation(self, exchange_index, percent=100):
+        body = {
+            "allocations": [
+                {"exchange_index": int(exchange_index), "percent": int(percent)}
+            ]
+        }
+        return self.request("POST", "/portfolio/target_balance_allocation", body=body)
 
     def get_positions(self, ticker=None):
         params = {"limit": 1000}
@@ -673,7 +681,6 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
         filled, remaining, status = confirm_fill(client, result["order_id"])
         log(f"{reason} exit confirmation: filled={filled}, remaining={remaining}, status={status}")
 
-    # Immediately blacklist the ticker so the bot stops averaging down into dying contracts
     if reason == "STOP LOSS":
         st.session_state.blacklisted_tickers.add(ticker)
         st.session_state["last_status_log"] = None 
@@ -731,8 +738,8 @@ with st.sidebar:
     manage_existing = st.checkbox("Manage existing position for TP/SL", value=False)
 
     st.divider()
-    st.header("🛠️ API Diagnostics")
-    st.caption("Force the API to show its internal balance ledger.")
+    st.header("🛠️ API Diagnostics & Shards")
+    st.caption("Fix insufficient balance by shifting funds to Crypto Shard 2.")
     
     if key_id and private_key_text:
         if st.button("🔍 Check Raw API Balance", use_container_width=True):
@@ -743,6 +750,14 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Diagnostics Error: {e}")
                 
+        if st.button("⚡ Move All Balance to Crypto Shard (Index 2)", use_container_width=True, type="primary"):
+            try:
+                diag_client = KalshiClient(key_id, private_key_text, demo_mode)
+                diag_client.set_target_allocation(exchange_index=2, percent=100)
+                st.success("Successfully allocated 100% balance to Crypto Shard 2! Wait 10 seconds and try running.")
+            except Exception as e:
+                st.error(f"Shard Allocation Error: {e}")
+
         if st.button("🧹 Cancel All Resting Orders", use_container_width=True, type="secondary"):
             try:
                 diag_client = KalshiClient(key_id, private_key_text, demo_mode)
@@ -848,13 +863,9 @@ def run_bot_cycle(client, daily_spent):
         log_once("discovery_err", f"Market discovery error: {error}")
         return
 
-    # Check Blacklist before making API calls
     if ticker in st.session_state.blacklisted_tickers:
         return
 
-    # ==========================================
-    # POSITIONS ROUTING
-    # ==========================================
     position = {"contracts": ZERO}
     avg_entry = None
 
@@ -873,9 +884,6 @@ def run_bot_cycle(client, daily_spent):
         position = {"ticker": ticker, "outcome": outcome_to_trade, "contracts": p_pos["contracts"]}
         avg_entry = p_pos["avg_cost"] if p_pos["contracts"] > 0 else None
 
-    # ==========================================
-    # TP / SL MANAGEMENT
-    # ==========================================
     if position["contracts"] > 0 and (manage_existing or ticker in st.session_state.bot_positions):
         try:
             exited = manage_position(client, trading_mode, position, avg_entry, take_profit_pct, stop_loss_pct)
@@ -896,9 +904,6 @@ def run_bot_cycle(client, daily_spent):
     if already_in_target_position:
         return
 
-    # ==========================================
-    # ENTRY LOGIC & DEFENSIVE FILTERS
-    # ==========================================
     signal = True
     live_bid = get_live_bid_price(client, ticker, outcome_to_trade)
     spread = entry_price - live_bid
@@ -947,7 +952,7 @@ def run_bot_cycle(client, daily_spent):
                 error_str = str(e).lower()
                 log(f"Order submission error exception caught: {e}")
                 if "insufficient balance" in error_str or "insufficient_balance" in error_str:
-                    log("🛑 STOPPING BOT: Insufficient balance. Please check your API Diagnostics panel.")
+                    log("🛑 STOPPING BOT: Insufficient balance. Try clicking 'Move All Balance to Crypto Shard' in sidebar.")
                     st.session_state.emergency_stop = True
                     st.session_state.running = False
                     st.rerun()
