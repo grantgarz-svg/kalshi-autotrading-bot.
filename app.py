@@ -20,13 +20,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 # ============================================================
 
 st.set_page_config(
-    page_title="Kalshi Scalper Pro",
+    page_title="KX Scalper Pro",
     page_icon="⚡",
     layout="wide",
 )
 
-st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened live Kalshi trading dashboard with Dedicated Buy/Sell Execution Log")
+st.title("⚡ KX Scalper Pro")
+st.caption("Production-hardened Kalshi trading dashboard with Aggressive Scalp Exits")
 
 
 # ============================================================
@@ -38,11 +38,6 @@ DEMO_BASE_URL = "https://external-api.demo.kalshi.co/trade-api/v2"
 
 LOG_FILE = Path("kalshi_orders.csv")
 ZERO = Decimal("0")
-
-MONTH_MAP = {
-    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
-}
 
 
 # ============================================================
@@ -127,7 +122,7 @@ def load_private_key(text):
 
 
 # ============================================================
-# AUTHENTICATION
+# AUTHENTICATION & CLIENT
 # ============================================================
 
 def create_signature(private_key, timestamp, method, path):
@@ -154,10 +149,6 @@ def create_headers(key_id, private_key, method, url):
         "Content-Type": "application/json",
     }
 
-
-# ============================================================
-# KALSHI CLIENT
-# ============================================================
 
 class KalshiClient:
     def __init__(self, key_id, private_key_text, demo=False):
@@ -259,7 +250,7 @@ class KalshiClient:
 
 
 # ============================================================
-# MARKET HELPERS & RATE-LIMIT SAFE DISCOVERY
+# MARKET HELPERS
 # ============================================================
 
 def parse_time(value):
@@ -583,7 +574,6 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
         })
         log(f"🟢 LIVE ORDER {action}: {contracts} {outcome} {ticker} @ {outcome_cents}¢ | filled={fill_count_value}")
         
-        # Add to separate execution log
         st.session_state.trade_logs.append({
             "Time": now_utc().strftime("%H:%M:%S"),
             "Mode": mode,
@@ -743,7 +733,9 @@ with st.sidebar:
     max_spread = st.slider("Max Bid/Ask Spread", min_value=1, max_value=50, value=5, format="%d¢")
     cooldown = st.slider("Cooldown between entries", min_value=10, max_value=1800, value=45, step=5, format="%d seconds")
     min_minutes_to_expiry = st.number_input("Do not enter if expiration is closer than", min_value=0.0, max_value=120.0, value=2.0, step=0.5)
-    take_profit_pct = st.number_input("Take profit %", min_value=0.0, max_value=500.0, value=20.0, step=1.0)
+    
+    # AGGRESSIVE DEFAULT TAKE PROFIT (8% instead of 20%)
+    take_profit_pct = st.number_input("Take profit %", min_value=0.0, max_value=500.0, value=8.0, step=1.0)
     stop_loss_pct = st.number_input("Stop loss %", min_value=0.0, max_value=99.0, value=25.0, step=1.0)
 
     st.divider()
@@ -772,7 +764,7 @@ if trading_mode == "LIVE TRADING":
 
 
 # ============================================================
-# START / STOP ACTIONS (WITH AUTOMATIC INTRA-EXCHANGE TRANSFER)
+# START / STOP ACTIONS
 # ============================================================
 
 c1, c2, c3 = st.columns(3)
@@ -827,7 +819,7 @@ if st.session_state.emergency_stop:
 
 
 # ============================================================
-# BOT ENGINE LOOP (Non-blocking via Streamlit Fragment)
+# BOT ENGINE LOOP
 # ============================================================
 
 def run_bot_cycle(client, daily_spent):
@@ -1060,9 +1052,6 @@ def render_dashboard_and_tick():
                 })
         st.dataframe(active_pos_list, use_container_width=True, hide_index=True)
 
-    # ==========================================
-    # DEDICATED EXECUTION LOG (BUYS & SELLS)
-    # ==========================================
     st.subheader("🛒 Execution Log (Buys & Sells)")
     if st.session_state.trade_logs:
         st.dataframe(st.session_state.trade_logs, use_container_width=True, hide_index=True)
