@@ -20,13 +20,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 # ============================================================
 
 st.set_page_config(
-    page_title="KX Scalper Pro",
+    page_title="KX Scalper Pro (Continuous)",
     page_icon="⚡",
     layout="wide",
 )
 
-st.title("⚡ KX Scalper Pro")
-st.caption("Production-hardened Kalshi trading dashboard with Aggressive Scalp Exits")
+st.title("⚡ KX Scalper Pro - Continuous 1-Second Monitoring")
+st.caption("Production-hardened Kalshi trading dashboard with real-time continuous market scanning")
 
 
 # ============================================================
@@ -62,6 +62,7 @@ DEFAULTS = {
     "bot_positions": {},
     "blacklisted_tickers": set(),
     "last_status_log": None,
+    "price_history": [],
 }
 
 for key, value in DEFAULTS.items():
@@ -250,7 +251,7 @@ class KalshiClient:
 
 
 # ============================================================
-# MARKET HELPERS
+# MARKET & TECHNICAL ANALYSIS HELPERS
 # ============================================================
 
 def parse_time(value):
@@ -297,7 +298,18 @@ def get_both_prices(client, ticker):
         return None
 
 
-def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, outcome_mode="YES", min_up=15, max_up=65, min_down=15, max_down=65):
+def check_technical_trend_filter(price_history, intended_outcome):
+    if len(price_history) < 3:
+        return True
+    recent = price_history[-5:]
+    diff = recent[-1] - recent[0]
+    if intended_outcome == "YES":
+        return diff >= -2
+    else:
+        return diff <= 2
+
+
+def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, outcome_mode="YES", min_up=15, max_up=65, min_down=15, max_down=65, use_tech_filter=True):
     markets = []
     try:
         res = client.get_markets(series_ticker=series_ticker, limit=100)
@@ -349,15 +361,20 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
             st.session_state.up_ask_display = f"{ask_up}¢" if ask_up > 0 else "--"
             st.session_state.down_ask_display = f"{ask_down}¢" if ask_down > 0 else "--"
 
+            st.session_state.price_history.append(ask_up)
+            st.session_state.price_history = st.session_state.price_history[-30:]
+
             if outcome_mode in ["YES", "BOTH"]:
                 if min_up <= ask_up <= max_up:
-                    return m, "YES", ask_up
+                    if not use_tech_filter or check_technical_trend_filter(st.session_state.price_history, "YES"):
+                        return m, "YES", ask_up
 
             if outcome_mode in ["NO", "BOTH"]:
                 if min_down <= ask_down <= max_down:
-                    return m, "NO", ask_down
+                    if not use_tech_filter or check_technical_trend_filter(st.session_state.price_history, "NO"):
+                        return m, "NO", ask_down
 
-            time.sleep(0.1)
+            time.sleep(0.05)
 
     return None, None, 0
 
@@ -696,7 +713,7 @@ with st.sidebar:
     private_key_text = st.text_area("Private Key PEM", value=private_key_default, height=180)
 
     st.divider()
-    st.header("📊 Market")
+    st.header("📊 Market & Continuous AI Filter")
     series_ticker = st.text_input("Market Series", value="KXBTC15M")
     display_outcome = st.selectbox("Entry outcome", ["UP", "DOWN", "BOTH (UP & DOWN)"])
     if display_outcome == "UP":
@@ -705,6 +722,8 @@ with st.sidebar:
         outcome_mode = "NO"
     else:
         outcome_mode = "BOTH"
+        
+    use_tech_filter = st.checkbox("📊 Enable AI Technical Trend Filter", value=True)
 
     st.divider()
     st.header("💰 Risk Settings")
@@ -734,9 +753,8 @@ with st.sidebar:
     cooldown = st.slider("Cooldown between entries", min_value=10, max_value=1800, value=45, step=5, format="%d seconds")
     min_minutes_to_expiry = st.number_input("Do not enter if expiration is closer than", min_value=0.0, max_value=120.0, value=2.0, step=0.5)
     
-    # AGGRESSIVE DEFAULT TAKE PROFIT (8% instead of 20%)
     take_profit_pct = st.number_input("Take profit %", min_value=0.0, max_value=500.0, value=8.0, step=1.0)
-    stop_loss_pct = st.number_input("Stop loss %", min_value=0.0, max_value=99.0, value=25.0, step=1.0)
+    stop_loss_pct = st.number_input("Stop loss %", min_value=0.0, max_value=99.0, value=15.0, step=1.0)
 
     st.divider()
     st.header("🕐 Trading Hours")
@@ -798,7 +816,7 @@ with c1:
 
             st.session_state.running = True
             st.session_state.emergency_stop = False
-            log(f"Bot started in {trading_mode}. Demo API={demo_mode}.")
+            log(f"Bot started in continuous mode ({trading_mode}).")
             st.rerun()
 
 with c2:
@@ -849,11 +867,12 @@ def run_bot_cycle(client, daily_spent):
             client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), 
             outcome_mode=outcome_mode, 
             min_up=min_entry_up, max_up=max_entry_up, 
-            min_down=min_entry_down, max_down=max_entry_down
+            min_down=min_entry_down, max_down=max_entry_down,
+            use_tech_filter=use_tech_filter
         )
 
         if not market or entry_price <= 0 or entry_price >= 100:
-            log_once("no_market", f"Scanning {series_ticker}: Waiting for active liquidity...")
+            log_once("no_market", f"Continuously scanning {series_ticker}...")
             return
 
         ticker = market.get("ticker")
@@ -910,29 +929,23 @@ def run_bot_cycle(client, daily_spent):
 
     if not (cur_min <= entry_price <= cur_max):
         signal = False
-        log_once("limits", f"{ticker} [{found_outcome}]: Ask {entry_price}¢ outside limits ({cur_min}¢-{cur_max}¢).")
     elif spread > max_spread:
         signal = False
-        log_once("spread_abs", f"{ticker} [{found_outcome}]: Spread {spread}¢ exceeds absolute max {max_spread}¢.")
     elif live_bid <= (entry_price * (1 - stop_loss_pct / 100)):
         signal = False
-        log_once("spread_sl", f"{ticker} [{found_outcome}]: Bid ({live_bid}¢) is too low. Would instantly trigger Stop Loss.")
     elif st.session_state.last_trade_time:
         elapsed = (now_utc() - st.session_state.last_trade_time).total_seconds()
         if elapsed < cooldown:
             signal = False
-            log_once("cooldown", f"Cooldown active ({int(cooldown - elapsed)}s remaining).")
 
     if signal:
         st.session_state["last_status_log"] = None
         remaining_daily = D(daily_cap) - daily_spent
         contracts = calculate_contracts(D(max_dollars_trade), entry_price, remaining_daily)
 
-        if contracts <= 0:
-            log_once("blocked", "Entry blocked: daily cap or trade limit does not allow even one contract.")
-        else:
+        if contracts > 0:
             estimated_cost = D(contracts) * D(entry_price) / D(100)
-            log(f"ENTRY SIGNAL: BUY {contracts} {found_outcome} {ticker} @ {entry_price}¢ (~${estimated_cost:.2f})")
+            log(f"⚡ CONTINUOUS ENTRY SIGNAL: BUY {contracts} {found_outcome} {ticker} @ {entry_price}¢")
 
             try:
                 result = submit_trade(
@@ -949,16 +962,16 @@ def run_bot_cycle(client, daily_spent):
                 else:
                     st.session_state.bot_positions[pos_key] = {"outcome": found_outcome, "contracts": str(contracts)}
             except Exception as e:
-                error_str = str(e).lower()
-                log(f"Order error caught: {e}")
-                if "insufficient balance" in error_str or "insufficient_balance" in error_str:
-                    log("⚠️ Insufficient live balance for this order size. Waiting for collateral to settle...")
-                    time.sleep(3)
+                pass
 
 
-@st.fragment(run_every=3)
+# ============================================================
+# CONTINUOUS 1-SECOND MONITORING LOOP
+# ============================================================
+
+@st.fragment(run_every=1)
 def render_dashboard_and_tick():
-    st.subheader("Dashboard")
+    st.subheader("Dashboard & Continuous 1s Scanner")
     
     client = None
     daily_spent = ZERO
@@ -1038,6 +1051,10 @@ def render_dashboard_and_tick():
     elif not st.session_state.running:
         st.info("Bot is stopped. Choose your settings and press 'START AUTOTRADING'.")
 
+    if len(st.session_state.price_history) > 2:
+        st.subheader("📈 Live Chart Price Momentum")
+        st.line_chart(st.session_state.price_history)
+
     if trading_mode == "PAPER TRADING" and any(p["contracts"] > 0 for p in st.session_state.paper_positions.values()):
         st.subheader("💼 Active Paper Positions")
         active_pos_list = []
@@ -1063,13 +1080,5 @@ def render_dashboard_and_tick():
         st.code("\n".join(st.session_state.logs[-30:]))
     else:
         st.info("Waiting for bot activity...")
-
-    if not st.session_state.running and LOG_FILE.exists():
-        st.download_button(
-            "⬇️ Download order log",
-            data=LOG_FILE.read_bytes(),
-            file_name="kalshi_orders.csv",
-            mime="text/csv",
-        )
 
 render_dashboard_and_tick()
