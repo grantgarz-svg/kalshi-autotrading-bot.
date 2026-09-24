@@ -26,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("⚡ Kalshi Scalper Pro")
-st.caption("Production-hardened live Kalshi trading dashboard with Graceful Balance Handling")
+st.caption("Production-hardened live Kalshi trading dashboard with Automatic Shard Fund Transfer")
 
 
 # ============================================================
@@ -204,13 +204,15 @@ class KalshiClient:
     def get_balance(self):
         return self.request("GET", "/portfolio/balance")
 
-    def set_target_allocation(self, exchange_index, percent=100):
+    def intra_exchange_transfer(self, amount_cents, source_shard=0, dest_shard=2):
         body = {
-            "allocations": [
-                {"exchange_index": int(exchange_index), "percent": int(percent)}
-            ]
+            "amount": int(amount_cents),
+            "source_exchange_shard": int(source_shard),
+            "destination_exchange_shard": int(dest_shard),
+            "source_subaccount": 0,
+            "destination_subaccount": 0
         }
-        return self.request("POST", "/portfolio/target_balance_allocation", body=body)
+        return self.request("POST", "/portfolio/intra_exchange_instance_transfer", body=body)
 
     def get_positions(self, ticker=None):
         params = {"limit": 1000}
@@ -751,7 +753,7 @@ if trading_mode == "LIVE TRADING":
 
 
 # ============================================================
-# START / STOP ACTIONS (WITH AUTOMATIC SHARD ROUTING)
+# START / STOP ACTIONS (WITH AUTOMATIC INTRA-EXCHANGE TRANSFER)
 # ============================================================
 
 c1, c2, c3 = st.columns(3)
@@ -767,12 +769,22 @@ with c1:
             if trading_mode == "LIVE TRADING":
                 try:
                     auto_client = KalshiClient(key_id, private_key_text, demo_mode)
-                    target_shard = 2 if "KXBTC" in series_ticker.upper() or "CRYPTO" in series_ticker.upper() else 0
-                    auto_client.set_target_allocation(exchange_index=target_shard, percent=100)
-                    log(f"⚡ Automatically routed 100% balance to Shard {target_shard} for {series_ticker}")
+                    bal_data = auto_client.get_balance()
+                    total_cents = int(bal_data.get("balance", 0))
+                    
+                    if "KXBTC" in series_ticker.upper() or "CRYPTO" in series_ticker.upper():
+                        target_shard = 2
+                        if total_cents > 0:
+                            # Programmatically transfer full balance from Shard 0 to Crypto Shard 2
+                            auto_client.intra_exchange_transfer(amount_cents=total_cents, source_shard=0, dest_shard=target_shard)
+                            log(f"⚡ Automatically transferred {total_cents} cents from Shard 0 to Crypto Shard {target_shard}!")
+                    else:
+                        target_shard = 0
+                        auto_client.intra_exchange_transfer(amount_cents=total_cents, source_shard=2, dest_shard=0)
+                        log(f"⚡ Automatically transferred {total_cents} cents to Default Shard 0")
                     time.sleep(1.5)
                 except Exception as e:
-                    log(f"⚠️ Auto-shard routing note: {e}")
+                    log(f"⚠️ Auto-shard transfer notice: {e}")
 
             st.session_state.running = True
             st.session_state.emergency_stop = False
@@ -930,7 +942,6 @@ def run_bot_cycle(client, daily_spent):
                 error_str = str(e).lower()
                 log(f"Order error caught: {e}")
                 if "insufficient balance" in error_str or "insufficient_balance" in error_str:
-                    # GRACEFUL RECOVERY: Do not stop the bot! Just log and wait for next cycle.
                     log("⚠️ Insufficient live balance for this order size. Waiting for collateral to settle...")
                     time.sleep(3)
 
