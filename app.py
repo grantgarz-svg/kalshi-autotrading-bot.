@@ -20,13 +20,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 # ============================================================
 
 st.set_page_config(
-    page_title="KX Scalper Pro (ROI Master Fix)",
+    page_title="KX Scalper Pro (Position Detection Fix)",
     page_icon="⚡",
     layout="wide",
 )
 
-st.title("⚡ KX Scalper Pro - Flawless ROI Exits")
-st.caption("High-frequency Kalshi trading dashboard with exact return percentage tracking for YES and NO contracts")
+st.title("⚡ KX Scalper Pro - Bulletproof Position Detection & ROI Exits")
+st.caption("High-frequency Kalshi trading dashboard with robust position tracking and exact return percentage exits")
 
 
 # ============================================================
@@ -360,32 +360,39 @@ def outcome_price_to_book_price(outcome, action, outcome_cents):
 
 
 def extract_position(positions_response, ticker, outcome_target=None):
-    rows = positions_response.get("market_positions", [])
+    rows = positions_response.get("market_positions", []) or positions_response.get("positions", []) or []
     for row in rows:
-        row_ticker = row.get("ticker") or row.get("market_ticker")
-        if row_ticker != ticker:
-            continue
+        row_ticker = row.get("ticker") or row.get("market_ticker") or row.get("event_ticker")
+        if row_ticker and ticker and row_ticker != ticker:
+            if not ticker.startswith(row_ticker) and not row_ticker.startswith(ticker):
+                continue
+                
         raw = row.get("position_fp") if row.get("position_fp") is not None else row.get("position")
+        if raw is None:
+            raw = row.get("count") or row.get("balance") or 0
         position = D(raw)
+        
+        row_outcome = str(row.get("outcome", row.get("side", ""))).upper()
+        
         if position > 0:
-            if outcome_target and outcome_target != "YES": continue
-            return {"ticker": ticker, "outcome": "YES", "contracts": position}
+            oc = "YES" if row_outcome not in ("NO", "DOWN") else "NO"
+            if outcome_target and outcome_target != oc: continue
+            return {"ticker": row_ticker or ticker, "outcome": oc, "contracts": position}
         if position < 0:
-            if outcome_target and outcome_target != "NO": continue
-            return {"ticker": ticker, "outcome": "NO", "contracts": abs(position)}
+            oc = "NO" if row_outcome not in ("YES", "UP") else "YES"
+            if outcome_target and outcome_target != oc: continue
+            return {"ticker": row_ticker or ticker, "outcome": oc, "contracts": abs(position)}
+            
     return {"ticker": ticker, "outcome": None, "contracts": ZERO}
 
 
 def fill_outcome(fill):
     action = str(fill.get("action", "")).upper()
-    
-    # 1. Direct outcome indicators
     for key in ["outcome_side", "outcome", "side_target"]:
         if fill.get(key):
             val = str(fill[key]).upper()
             if val in ("YES", "NO"): return val
             
-    # 2. Derive from 'side' (bid/ask) and 'action' (buy/sell)
     side = str(fill.get("side", "")).upper()
     if side in ("YES", "NO"): return side
     
@@ -400,7 +407,6 @@ def fill_outcome(fill):
 
 
 def fill_price(fill, outcome):
-    # Fixed NO contract parsing! Kalshi V2 sometimes just uses "price"
     keys_to_try = []
     if outcome == "YES":
         keys_to_try = ["yes_price_dollars", "yes_price", "price_dollars", "price"]
@@ -769,7 +775,7 @@ with c1:
 
             st.session_state.running = True
             st.session_state.emergency_stop = False
-            log(f"Bot started with ROI % Exits ({trading_mode}).")
+            log(f"Bot started with Robust Position Tracking ({trading_mode}).")
             st.rerun()
 
 with c2:
@@ -873,7 +879,7 @@ def run_bot_cycle(client, daily_spent):
     spread = entry_price - live_bid
 
     cur_min = min_entry_up if found_outcome == "YES" else min_entry_down
-    cur_max = max_entry_up if found_outcome == "YES" else max_entry_down
+    cur_max = max_entry_up if found_outcome == "YES" else max_entry_up
 
     if not (cur_min <= entry_price <= cur_max):
         signal = False
@@ -909,7 +915,7 @@ def run_bot_cycle(client, daily_spent):
 
 @st.fragment(run_every=1)
 def render_dashboard_and_tick():
-    st.subheader("Dashboard & ROI % Scanner")
+    st.subheader("Dashboard & Position Scanner")
     
     client = None
     daily_spent = ZERO
