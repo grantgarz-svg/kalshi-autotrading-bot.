@@ -20,13 +20,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 # ============================================================
 
 st.set_page_config(
-    page_title="KX Scalper Pro (ROI % Exit)",
+    page_title="KX Scalper Pro (ROI Master Fix)",
     page_icon="⚡",
     layout="wide",
 )
 
-st.title("⚡ KX Scalper Pro - ROI % Exits & Live P/L")
-st.caption("High-frequency Kalshi trading dashboard with exact return percentage tracking")
+st.title("⚡ KX Scalper Pro - Flawless ROI Exits")
+st.caption("High-frequency Kalshi trading dashboard with exact return percentage tracking for YES and NO contracts")
 
 
 # ============================================================
@@ -377,26 +377,43 @@ def extract_position(positions_response, ticker, outcome_target=None):
 
 
 def fill_outcome(fill):
-    outcome = fill.get("outcome_side") or fill.get("side") or fill.get("outcome")
-    if outcome:
-        return str(outcome).upper()
-    book_side = str(fill.get("book_side", "")).lower()
-    if book_side == "bid": return "YES"
-    if book_side == "ask": return "NO"
+    action = str(fill.get("action", "")).upper()
+    
+    # 1. Direct outcome indicators
+    for key in ["outcome_side", "outcome", "side_target"]:
+        if fill.get(key):
+            val = str(fill[key]).upper()
+            if val in ("YES", "NO"): return val
+            
+    # 2. Derive from 'side' (bid/ask) and 'action' (buy/sell)
+    side = str(fill.get("side", "")).upper()
+    if side in ("YES", "NO"): return side
+    
+    if action == "BUY":
+        if side == "BID": return "YES"
+        if side == "ASK": return "NO"
+    elif action == "SELL":
+        if side == "ASK": return "YES"
+        if side == "BID": return "NO"
+        
     return None
 
 
-def fill_action(fill):
-    action = fill.get("action")
-    return str(action).upper() if action else None
-
-
 def fill_price(fill, outcome):
-    raw = fill.get("yes_price_dollars") or fill.get("yes_price") if outcome == "YES" else fill.get("no_price_dollars") or fill.get("no_price")
-    value = D(raw)
-    if value > 1:
-        value = value / D(100)
-    return value
+    # Fixed NO contract parsing! Kalshi V2 sometimes just uses "price"
+    keys_to_try = []
+    if outcome == "YES":
+        keys_to_try = ["yes_price_dollars", "yes_price", "price_dollars", "price"]
+    else:
+        keys_to_try = ["no_price_dollars", "no_price", "price_dollars", "price"]
+        
+    for k in keys_to_try:
+        if fill.get(k) is not None:
+            val = D(fill.get(k))
+            if val > 1: return val / D(100)
+            return val
+            
+    return ZERO
 
 
 def fill_count(fill):
@@ -412,7 +429,7 @@ def reconstruct_average_entry(fills, ticker, outcome):
         f_outcome = fill_outcome(fill)
         if f_outcome != outcome:
             continue
-        action = fill_action(fill)
+        action = str(fill.get("action", "")).upper()
         if action not in ("BUY", "SELL"):
             continue
         qty = fill_count(fill)
@@ -612,7 +629,7 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
 
     reason = None
     if take_profit_pct > 0 and roi_pct >= D(take_profit_pct):
-        reason = f"TAKE PROFIT ({roi_pct:.2f}%)"
+        reason = f"TAKE PROFIT (+{roi_pct:.2f}%)"
     elif stop_loss_pct > 0 and roi_pct <= -D(stop_loss_pct):
         reason = f"STOP LOSS ({roi_pct:.2f}%)"
     elif enable_panic and mins_left is not None and mins_left <= panic_mins and current < avg_entry:
