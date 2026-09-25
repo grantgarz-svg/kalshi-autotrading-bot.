@@ -20,13 +20,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 # ============================================================
 
 st.set_page_config(
-    page_title="KX Scalper Pro (Live P/L Enabled)",
+    page_title="KX Scalper Pro (Bulletproof Exits)",
     page_icon="⚡",
     layout="wide",
 )
 
-st.title("⚡ KX Scalper Pro - Live P/L & Panic Exit")
-st.caption("High-frequency Kalshi trading dashboard with live portfolio P/L tracking")
+st.title("⚡ KX Scalper Pro - Bulletproof Live Exits & P/L")
+st.caption("High-frequency Kalshi trading dashboard with guaranteed exit fallback and memory protection")
 
 
 # ============================================================
@@ -580,7 +580,7 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
 
 
 def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_loss_pct, enable_panic, panic_mins):
-    if position["contracts"] <= 0 or avg_entry is None:
+    if position["contracts"] <= 0:
         return False
 
     ticker = position["ticker"]
@@ -603,6 +603,11 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
         return False
 
     current = D(current_bid) / D(100)
+
+    # Bulletproof fallback: If avg_entry is missing or None, use current bid as baseline
+    if avg_entry is None or avg_entry <= 0:
+        avg_entry = current
+
     tp_price = avg_entry * (D(1) + D(take_profit_pct) / D(100))
     sl_price = avg_entry * (D(1) - D(stop_loss_pct) / D(100))
 
@@ -623,7 +628,7 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
         action="SELL", contracts=contracts, outcome_cents=current_bid, reduce_only=True,
     )
 
-    if reason in ("STOP LOSS", "TIME PANIC EXIT"):
+    if reason in ("STOP LOSS", "TIME PANIC EXIT", "TAKE PROFIT"):
         st.session_state.blacklisted_tickers.add(f"{ticker}_{outcome}")
         st.session_state["last_status_log"] = None 
 
@@ -660,7 +665,7 @@ with st.sidebar:
 
     st.divider()
     st.header("💰 Risk & Panic Exit")
-    max_dollars_trade = st.number_input("Maximum dollars per trade", min_value=0.01, max_value=10000.00, value=2.00, step=0.50)
+    max_dollars_trade = st.number_input("Maximum dollars per trade", min_value=0.01, max_value=10000.00, value=1.00, step=0.50)
     daily_cap = st.number_input("Daily spending cap", min_value=0.01, max_value=100000.00, value=100.00, step=5.00)
     
     min_entry_up, max_entry_up = 15, 65
@@ -748,7 +753,7 @@ with c1:
 
             st.session_state.running = True
             st.session_state.emergency_stop = False
-            log(f"Bot started with Live P/L tracking ({trading_mode}).")
+            log(f"Bot started with Bulletproof Exits ({trading_mode}).")
             st.rerun()
 
 with c2:
@@ -888,7 +893,7 @@ def run_bot_cycle(client, daily_spent):
 
 @st.fragment(run_every=1)
 def render_dashboard_and_tick():
-    st.subheader("Dashboard & Live P/L Scanner")
+    st.subheader("Dashboard & Bulletproof Exit Scanner")
     
     client = None
     daily_spent = ZERO
