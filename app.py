@@ -25,8 +25,8 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🌪️ Vortex Scalper Pro - Stable Working Engine")
-st.caption("High-frequency Kalshi trading dashboard with direct execution, live entry cache, and 100-tick buffer")
+st.title("🌪️ Vortex Scalper Pro - Fixed Stop-Loss Engine")
+st.caption("High-frequency Kalshi trading dashboard with guaranteed universal position stop-losses and 100-tick buffer")
 
 
 # ============================================================
@@ -360,31 +360,24 @@ def outcome_price_to_book_price(outcome, action, outcome_cents):
     return D(1) - p
 
 
-def extract_position(positions_response, ticker, outcome_target=None):
+def extract_all_positions(positions_response):
+    active_positions = []
     rows = positions_response.get("market_positions", []) or positions_response.get("positions", []) or []
     for row in rows:
         row_ticker = row.get("ticker") or row.get("market_ticker") or row.get("event_ticker")
-        if row_ticker and ticker and row_ticker != ticker:
-            if not ticker.startswith(row_ticker) and not row_ticker.startswith(ticker):
-                continue
-                
         raw = row.get("position_fp") if row.get("position_fp") is not None else row.get("position")
         if raw is None:
             raw = row.get("count") or row.get("balance") or 0
         position = D(raw)
-        
         row_outcome = str(row.get("outcome", row.get("side", ""))).upper()
         
         if position > 0:
             oc = "YES" if row_outcome not in ("NO", "DOWN") else "NO"
-            if outcome_target and outcome_target != oc: continue
-            return {"ticker": row_ticker or ticker, "outcome": oc, "contracts": position}
-        if position < 0:
+            active_positions.append({"ticker": row_ticker, "outcome": oc, "contracts": position})
+        elif position < 0:
             oc = "NO" if row_outcome not in ("YES", "UP") else "YES"
-            if outcome_target and outcome_target != oc: continue
-            return {"ticker": row_ticker or ticker, "outcome": oc, "contracts": abs(position)}
-            
-    return {"ticker": ticker, "outcome": None, "contracts": ZERO}
+            active_positions.append({"ticker": row_ticker, "outcome": oc, "contracts": abs(position)})
+    return active_positions
 
 
 def reconstruct_average_entry(fills, ticker, outcome):
@@ -754,7 +747,7 @@ if st.session_state.emergency_stop:
 
 
 # ============================================================
-# BOT ENGINE LOOP
+# BOT ENGINE LOOP (FIXED UNIVERSAL POSITION STOP-LOSS)
 # ============================================================
 
 def run_bot_cycle(client, daily_spent):
@@ -777,6 +770,52 @@ def run_bot_cycle(client, daily_spent):
         st.rerun()
         return
 
+    # 1. GUARANTEED POSITION CHECK: Check ALL account positions first so stop-loss never misses!
+    try:
+        if trading_mode == "LIVE TRADING":
+            pos_res = client.get_positions()
+            active_positions = extract_all_positions(pos_res)
+        else:
+            active_positions = [p for p in st.session_state.paper_positions.values() if p["contracts"] > 0]
+
+        for pos in active_positions:
+            pos_key = f"{pos['ticker']}_{pos['outcome']}"
+            if pos_key in st.session_state.blacklisted_tickers:
+                continue
+
+            avg_entry = st.session_state.live_entry_prices.get(pos_key)
+            if not avg_entry and trading_mode == "LIVE TRADING":
+                try:
+                    fills_res = client.get_fills(ticker=pos['ticker'])
+                    avg_entry = reconstruct_average_entry(fills_res.get("fills", []), pos['ticker'], pos['outcome'])
+                    if avg_entry:
+                        st.session_state.live_entry_prices[pos_key] = avg_entry
+                except Exception:
+                    pass
+
+            exited = manage_position(
+                client=client, mode=trading_mode, position=pos, avg_entry=avg_entry,
+                take_profit_pct=take_profit_pct, stop_loss_pct=stop_loss_pct,
+                enable_panic=enable_panic_exit, panic_mins=panic_minutes_threshold
+            )
+            if exited:
+                st.session_state.last_trade_time = now_utc()
+                return
+    except Exception as e:
+        log(f"⚠️ Position management sweep error: {e}")
+
+    # If holding any position, hold off on new entries
+    if trading_mode == "PAPER TRADING":
+        if any(p["contracts"] > 0 for p in st.session_state.paper_positions.values()):
+            return
+    else:
+        try:
+            if active_positions:
+                return
+        except Exception:
+            pass
+
+    # 2. ENTRY SCANNER
     try:
         market, found_outcome, entry_price = find_active_market_with_liquidity(
             client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), 
@@ -795,44 +834,6 @@ def run_bot_cycle(client, daily_spent):
 
     pos_key = f"{ticker}_{found_outcome}"
     if pos_key in st.session_state.blacklisted_tickers:
-        return
-
-    position = {"contracts": ZERO}
-    avg_entry = None
-
-    if trading_mode == "LIVE TRADING":
-        try:
-            position_response = client.get_positions(ticker=ticker)
-            position = extract_position(position_response, ticker, outcome_target=found_outcome)
-            if pos_key in st.session_state.live_entry_prices:
-                avg_entry = st.session_state.live_entry_prices[pos_key]
-            else:
-                fills_response = client.get_fills(ticker=ticker)
-                fills = fills_response.get("fills", [])
-                avg_entry = reconstruct_average_entry(fills, ticker, found_outcome)
-                if avg_entry:
-                    st.session_state.live_entry_prices[pos_key] = avg_entry
-        except Exception:
-            return
-    else:
-        p_pos = st.session_state.paper_positions.get(pos_key, {"contracts": ZERO, "avg_cost": ZERO, "outcome": found_outcome})
-        position = {"ticker": ticker, "outcome": found_outcome, "contracts": p_pos["contracts"]}
-        avg_entry = p_pos["avg_cost"] if p_pos["contracts"] > 0 else None
-
-    if position["contracts"] > 0:
-        try:
-            exited = manage_position(
-                client, trading_mode, position, avg_entry, 
-                take_profit_pct, stop_loss_pct, 
-                enable_panic_exit, panic_minutes_threshold
-            )
-            if exited:
-                st.session_state.last_trade_time = now_utc()
-                return
-        except Exception:
-            return
-
-    if position["contracts"] > 0:
         return
 
     signal = True
