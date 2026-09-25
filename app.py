@@ -25,8 +25,8 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🌪️ Vortex Scalper Pro - Live Streaming 100-Tick Engine")
-st.caption("High-frequency Kalshi trading dashboard with real-time graph streaming and autonomous position management")
+st.title("🌪️ Vortex Scalper Pro - Direct Execution Engine")
+st.caption("High-frequency Kalshi trading dashboard with clean, direct trade execution and 100-tick streaming buffer")
 
 
 # ============================================================
@@ -52,7 +52,7 @@ DEFAULTS = {
     "paper_trades": [],
     "paper_positions": {},      
     "paper_realized_pnl": ZERO, 
-    "live_entry_prices": {},    # Instant cache for live fill entry prices
+    "live_entry_prices": {},    
     "starting_live_balance": None,
     "last_trade_time": None,
     "active_ticker": None,
@@ -93,7 +93,7 @@ def log(message):
     stamp = now_utc().strftime("%H:%M:%S")
     line = f"[{stamp}] {message}"
     st.session_state.logs.append(line)
-    st.session_state.logs = st.session_state.logs[-30:]
+    st.session_state.logs = st.session_state.logs[-40:]
 
 def log_once(msg_key, message):
     if st.session_state.get("last_status_log") != msg_key:
@@ -295,16 +295,17 @@ def evaluate_historical_memory(price_history, intended_outcome):
     recent = price_history[-20:]
     momentum = recent[-1] - recent[0]
     if intended_outcome == "YES":
-        return momentum >= -3
+        return momentum >= -5
     else:
-        return momentum <= 3
+        return momentum <= 5
 
 
-def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, outcome_mode="YES", min_up=15, max_up=65, min_down=15, max_down=65, use_memory_filter=True):
+def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, outcome_mode="YES", min_up=1, max_up=99, min_down=1, max_down=99, use_memory_filter=True):
     try:
         res = client.get_markets(series_ticker=series_ticker, limit=30)
         markets = res.get("markets", [])
-    except Exception:
+    except Exception as e:
+        log(f"⚠️ API Error fetching markets: {e}")
         return None, None, 0
 
     open_markets = [m for m in markets if str(m.get("status", "")).lower() not in ("closed", "settled", "finalized")]
@@ -314,6 +315,7 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         valid_markets = [m for m in open_markets if market_minutes_remaining(m) is not None and market_minutes_remaining(m) > 0]
 
     if not valid_markets:
+        log_once("no_markets", f"⚠️ No open valid markets found for series {series_ticker}")
         return None, None, 0
 
     for m in valid_markets:
@@ -324,16 +326,32 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         
         ask_up = prices["YES"]["ask"]
         ask_down = prices["NO"]["ask"]
+        
+        st.session_state.active_ticker = t
+        st.session_state.up_ask_display = f"{ask_up}¢" if ask_up > 0 else "--"
+        st.session_state.down_ask_display = f"{ask_down}¢" if ask_down > 0 else "--"
+
+        if ask_up > 0:
+            st.session_state.price_history.append(ask_up)
+            st.session_state.price_history = st.session_state.price_history[-100:]
 
         if outcome_mode in ["YES", "BOTH"]:
             if min_up <= ask_up <= max_up:
-                if not use_memory_filter or evaluate_historical_memory(st.session_state.price_history, "YES"):
-                    return m, "YES", ask_up
+                if use_memory_filter and not evaluate_historical_memory(st.session_state.price_history, "YES"):
+                    log_once(f"mem_skip_{t}", f"⏳ Skipping {t} (UP): Memory momentum filter blocked trade.")
+                    continue
+                return m, "YES", ask_up
+            else:
+                log_once(f"range_skip_up_{t}", f"🔍 Scanning {t}: UP Ask {ask_up}¢ outside range [{min_up}, {max_up}]¢")
 
         if outcome_mode in ["NO", "BOTH"]:
             if min_down <= ask_down <= max_down:
-                if not use_memory_filter or evaluate_historical_memory(st.session_state.price_history, "NO"):
-                    return m, "NO", ask_down
+                if use_memory_filter and not evaluate_historical_memory(st.session_state.price_history, "NO"):
+                    log_once(f"mem_skip_down_{t}", f"⏳ Skipping {t} (DOWN): Memory momentum filter blocked trade.")
+                    continue
+                return m, "NO", ask_down
+            else:
+                log_once(f"range_skip_down_{t}", f"🔍 Scanning {t}: DOWN Ask {ask_down}¢ outside range [{min_down}, {max_down}]¢")
 
         time.sleep(0.02)
 
@@ -353,11 +371,14 @@ def outcome_price_to_book_price(outcome, action, outcome_cents):
     return D(1) - p
 
 
-def extract_all_positions(positions_response):
-    active_positions = []
+def extract_position(positions_response, ticker, outcome_target=None):
     rows = positions_response.get("market_positions", []) or positions_response.get("positions", []) or []
     for row in rows:
         row_ticker = row.get("ticker") or row.get("market_ticker") or row.get("event_ticker")
+        if row_ticker and ticker and row_ticker != ticker:
+            if not ticker.startswith(row_ticker) and not row_ticker.startswith(ticker):
+                continue
+                
         raw = row.get("position_fp") if row.get("position_fp") is not None else row.get("position")
         if raw is None:
             raw = row.get("count") or row.get("balance") or 0
@@ -366,11 +387,14 @@ def extract_all_positions(positions_response):
         
         if position > 0:
             oc = "YES" if row_outcome not in ("NO", "DOWN") else "NO"
-            active_positions.append({"ticker": row_ticker, "outcome": oc, "contracts": position})
-        elif position < 0:
+            if outcome_target and outcome_target != oc: continue
+            return {"ticker": row_ticker or ticker, "outcome": oc, "contracts": position}
+        if position < 0:
             oc = "NO" if row_outcome not in ("YES", "UP") else "YES"
-            active_positions.append({"ticker": row_ticker, "outcome": oc, "contracts": abs(position)})
-    return active_positions
+            if outcome_target and outcome_target != oc: continue
+            return {"ticker": row_ticker or ticker, "outcome": oc, "contracts": abs(position)}
+            
+    return {"ticker": ticker, "outcome": None, "contracts": ZERO}
 
 
 def reconstruct_average_entry(fills, ticker, outcome):
@@ -468,6 +492,11 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
                 pos["avg_cost"] = ZERO
         st.session_state.paper_positions[pos_key] = pos
         log(f"📝 PAPER {action} {contracts} {outcome} {ticker} @ {outcome_cents}¢")
+        st.session_state.trade_logs.append({
+            "Time": now_utc().strftime("%H:%M:%S"), "Mode": mode, "Action": action,
+            "Outcome": outcome, "Ticker": ticker, "Contracts": contracts,
+            "Price": f"{outcome_cents}¢", "Cost/Value": f"${estimated_cost:.2f}", "Status": "Filled"
+        })
         return {"status": "paper_fill"}
 
     try:
@@ -483,6 +512,11 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
             st.session_state.live_entry_prices.pop(pos_key, None)
 
         log(f"🟢 LIVE ORDER {action}: {contracts} {outcome} {ticker} @ {outcome_cents}¢")
+        st.session_state.trade_logs.append({
+            "Time": now_utc().strftime("%H:%M:%S"), "Mode": mode, "Action": action,
+            "Outcome": outcome, "Ticker": ticker, "Contracts": contracts,
+            "Price": f"{outcome_cents}¢", "Cost/Value": f"${estimated_cost:.2f}", "Status": order.get("status", "submitted")
+        })
         return {"status": order.get("status", "submitted")}
     except Exception as error:
         log(f"❌ LIVE ORDER FAILED: {error}")
@@ -538,7 +572,7 @@ def manage_position(client, mode, position, take_profit_pct, stop_loss_pct, enab
     if reason is None:
         return False
 
-    log(f"🌪️ VORTEX AUTO-{reason}: {ticker} {outcome} entry=${avg_entry:.4f}, bid=${current:.4f}")
+    log(f"🌪️ VORTEX {reason}: {ticker} {outcome} entry=${avg_entry:.4f}, bid=${current:.4f}")
     submit_trade(
         client=client, mode=mode, ticker=ticker, outcome=outcome,
         action="SELL", contracts=contracts, outcome_cents=current_bid, reduce_only=True,
@@ -637,7 +671,7 @@ with c1:
                     pass
             st.session_state.running = True
             st.session_state.emergency_stop = False
-            log(f"Vortex Scalper Pro live-streaming mode started ({trading_mode}).")
+            log(f"Vortex Scalper Pro direct execution mode started ({trading_mode}).")
             st.rerun()
 
 with c2:
@@ -658,7 +692,7 @@ if st.session_state.emergency_stop:
 
 
 # ============================================================
-# BOT ENGINE LOOP WITH UNIVERSAL POSITION MANAGEMENT
+# BOT ENGINE LOOP (DIRECT EXECUTION FLOW)
 # ============================================================
 
 def run_bot_cycle(client, daily_spent):
@@ -677,42 +711,10 @@ def run_bot_cycle(client, daily_spent):
         return
 
     if daily_spent >= D(daily_cap):
+        log_once("daily_cap_reached", f"🛑 Daily spending cap reached (${daily_spent:.2f} / ${daily_cap:.2f}). Stopping bot.")
         st.session_state.running = False
         st.rerun()
         return
-
-    try:
-        if trading_mode == "LIVE TRADING":
-            pos_res = client.get_positions()
-            active_positions = extract_all_positions(pos_res)
-        else:
-            active_positions = [p for p in st.session_state.paper_positions.values() if p["contracts"] > 0]
-
-        for pos in active_positions:
-            pos_key = f"{pos['ticker']}_{pos['outcome']}"
-            if pos_key in st.session_state.blacklisted_tickers:
-                continue
-            
-            exited = manage_position(
-                client=client, mode=trading_mode, position=pos,
-                take_profit_pct=take_profit_pct, stop_loss_pct=stop_loss_pct,
-                enable_panic=enable_panic_exit, panic_mins=panic_minutes_threshold
-            )
-            if exited:
-                st.session_state.last_trade_time = now_utc()
-                return
-    except Exception as e:
-        log(f"⚠️ Position management sweep error: {e}")
-
-    if trading_mode == "PAPER TRADING":
-        if any(p["contracts"] > 0 for p in st.session_state.paper_positions.values()):
-            return
-    else:
-        try:
-            if active_positions:
-                return
-        except Exception:
-            pass
 
     try:
         market, found_outcome, entry_price = find_active_market_with_liquidity(
@@ -725,11 +727,32 @@ def run_bot_cycle(client, daily_spent):
         if not market or entry_price <= 0 or entry_price >= 100:
             return
         ticker = market.get("ticker")
-    except Exception:
+    except Exception as e:
+        log(f"⚠️ Market search error: {e}")
         return
 
     pos_key = f"{ticker}_{found_outcome}"
     if pos_key in st.session_state.blacklisted_tickers:
+        return
+
+    # Check position for current target market directly
+    position = {"contracts": ZERO}
+    if trading_mode == "LIVE TRADING":
+        try:
+            pos_res = client.get_positions(ticker=ticker)
+            position = extract_position(pos_res, ticker, outcome_target=found_outcome)
+        except Exception:
+            pass
+    else:
+        p_pos = st.session_state.paper_positions.get(pos_key, {"contracts": ZERO})
+        position = {"ticker": ticker, "outcome": found_outcome, "contracts": p_pos["contracts"]}
+
+    if position["contracts"] > 0:
+        manage_position(
+            client=client, mode=trading_mode, position=position,
+            take_profit_pct=take_profit_pct, stop_loss_pct=stop_loss_pct,
+            enable_panic=enable_panic_exit, panic_mins=panic_minutes_threshold
+        )
         return
 
     signal = True
@@ -739,6 +762,7 @@ def run_bot_cycle(client, daily_spent):
     spread = entry_price - live_bid
 
     if spread > max_spread:
+        log_once(f"spread_skip_{ticker}", f"⏳ Skipping {ticker}: Spread ({spread}¢) exceeds max allowed ({max_spread}¢).")
         signal = False
     elif st.session_state.last_trade_time:
         elapsed = (now_utc() - st.session_state.last_trade_time).total_seconds()
@@ -768,7 +792,7 @@ def run_bot_cycle(client, daily_spent):
 
 @st.fragment(run_every=1)
 def render_dashboard_and_tick():
-    st.subheader("🌪️ Vortex Dashboard & Live Streaming Engine")
+    st.subheader("🌪️ Vortex Dashboard & Direct Engine")
     
     client = None
     daily_spent = ZERO
@@ -808,7 +832,6 @@ def render_dashboard_and_tick():
                     st.session_state.up_ask_display = f"{ask_up}¢" if ask_up > 0 else "--"
                     st.session_state.down_ask_display = f"{p_sample['NO']['ask']}¢" if p_sample['NO']['ask'] > 0 else "--"
                     
-                    # Stream live prices directly into the 100-tick buffer every second
                     if ask_up > 0:
                         st.session_state.price_history.append(ask_up)
                         st.session_state.price_history = st.session_state.price_history[-100:]
@@ -858,9 +881,9 @@ def render_dashboard_and_tick():
     else:
         st.info("No trades executed yet.")
 
-    st.subheader("📜 Vortex Log")
+    st.subheader("📜 Vortex Diagnostic Log")
     if st.session_state.logs:
-        st.code("\n".join(st.session_state.logs[-15:]))
+        st.code("\n".join(st.session_state.logs[-20:]))
     else:
         st.info("Waiting for Vortex activity...")
 
