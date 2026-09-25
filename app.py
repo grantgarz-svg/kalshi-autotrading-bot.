@@ -25,8 +25,8 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🌪️ Vortex Scalper Pro - Bulletproof Stop-Loss & Daily Tracker")
-st.caption("High-frequency Kalshi trading dashboard with instant live entry caching and error-logged stop-losses")
+st.title("🌪️ Vortex Scalper Pro - Stable Working Engine")
+st.caption("High-frequency Kalshi trading dashboard with direct execution, live entry cache, and 100-tick buffer")
 
 
 # ============================================================
@@ -330,7 +330,7 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         st.session_state.down_ask_display = f"{ask_down}¢" if ask_down > 0 else "--"
 
         st.session_state.price_history.append(ask_up)
-        st.session_state.price_history = st.session_state.price_history[-200:]
+        st.session_state.price_history = st.session_state.price_history[-100:]
 
         if outcome_mode in ["YES", "BOTH"]:
             if min_up <= ask_up <= max_up:
@@ -387,86 +387,37 @@ def extract_position(positions_response, ticker, outcome_target=None):
     return {"ticker": ticker, "outcome": None, "contracts": ZERO}
 
 
-def fill_outcome(fill):
-    action = str(fill.get("action", "")).upper()
-    for key in ["outcome_side", "outcome", "side_target"]:
-        if fill.get(key):
-            val = str(fill[key]).upper()
-            if val in ("YES", "NO"): return val
-            
-    side = str(fill.get("side", "")).upper()
-    if side in ("YES", "NO"): return side
-    
-    if action == "BUY":
-        if side == "BID": return "YES"
-        if side == "ASK": return "NO"
-    elif action == "SELL":
-        if side == "ASK": return "YES"
-        if side == "BID": return "NO"
-        
-    return None
-
-
-def fill_price(fill, outcome):
-    keys_to_try = []
-    if outcome == "YES":
-        keys_to_try = ["yes_price_dollars", "yes_price", "price_dollars", "price"]
-    else:
-        keys_to_try = ["no_price_dollars", "no_price", "price_dollars", "price"]
-        
-    for k in keys_to_try:
-        if fill.get(k) is not None:
-            val = D(fill.get(k))
-            if val > 1: return val / D(100)
-            return val
-            
-    return ZERO
-
-
-def fill_count(fill):
-    raw = fill.get("count_fp") or fill.get("count") or fill.get("filled_count_fp") or fill.get("filled_count")
-    return D(raw)
-
-
 def reconstruct_average_entry(fills, ticker, outcome):
     relevant = []
     for fill in fills:
         if fill.get("ticker") and fill.get("ticker") != ticker:
             continue
-        f_outcome = fill_outcome(fill)
-        if f_outcome != outcome:
-            continue
         action = str(fill.get("action", "")).upper()
         if action not in ("BUY", "SELL"):
             continue
-        qty = fill_count(fill)
-        price = fill_price(fill, outcome)
-        if qty <= 0 or price <= 0:
-            continue
-        created = fill.get("created_time") or fill.get("ts") or ""
-        relevant.append((str(created), action, qty, price))
+        qty = D(fill.get("count_fp") or fill.get("count") or 0)
+        price = D(fill.get("price_dollars") or fill.get("price") or 0)
+        if price > 1: price = price / D(100)
+        if qty <= 0 or price <= 0: continue
+        relevant.append((str(fill.get("created_time", "")), action, qty, price))
 
     relevant.sort(key=lambda x: x[0])
     lots = []
     for _, action, qty, price in relevant:
         if action == "BUY":
             lots.append([qty, price])
-            continue
-        remaining = qty
-        while remaining > 0 and lots:
-            lot_qty, lot_price = lots[0]
-            take = min(remaining, lot_qty)
-            lot_qty -= take
-            remaining -= take
-            if lot_qty <= 0:
-                lots.pop(0)
-            else:
-                lots[0][0] = lot_qty
+        else:
+            remaining = qty
+            while remaining > 0 and lots:
+                l_qty, l_price = lots[0]
+                take = min(remaining, l_qty)
+                lots[0][0] -= take
+                remaining -= take
+                if lots[0][0] <= 0: lots.pop(0)
 
-    total_qty = sum((lot[0] for lot in lots), ZERO)
-    if total_qty <= 0:
-        return None
-    total_cost = sum((lot_qty * lot_price for lot_qty, lot_price in lots), ZERO)
+    total_qty = sum((l[0] for l in lots), ZERO)
+    if total_qty <= 0: return None
+    total_cost = sum((l[0] * l[1] for l in lots), ZERO)
     return total_cost / total_qty
 
 
@@ -482,11 +433,9 @@ def calculate_daily_spend(client):
     for fill in fills:
         if str(fill.get("action", "")).lower() != "buy":
             continue
-        outcome = fill_outcome(fill)
-        if outcome not in ("YES", "NO"):
-            continue
-        qty = fill_count(fill)
-        price = fill_price(fill, outcome)
+        qty = D(fill.get("count_fp") or fill.get("count") or 0)
+        price = D(fill.get("price_dollars") or fill.get("price") or 0)
+        if price > 1: price = price / D(100)
         fee = D(fill.get("fee_cost", 0))
         total += (qty * price) + fee
     return total
@@ -513,33 +462,25 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
     client_order_id = make_client_order_id()
     
     st.session_state.last_client_order_id = client_order_id
-
     pos_key = f"{ticker}_{outcome}"
 
     if mode == "PAPER TRADING":
         contracts_d = D(contracts)
         price_d = D(outcome_cents) / D(100)
-        
         if pos_key not in st.session_state.paper_positions:
             st.session_state.paper_positions[pos_key] = {"contracts": ZERO, "avg_cost": ZERO, "ticker": ticker, "outcome": outcome}
-            
         pos = st.session_state.paper_positions[pos_key]
-
         if action == "BUY":
             total_current_cost = pos["contracts"] * pos["avg_cost"]
-            new_cost = contracts_d * price_d
             pos["contracts"] += contracts_d
-            pos["avg_cost"] = (total_current_cost + new_cost) / pos["contracts"]
+            pos["avg_cost"] = (total_current_cost + (contracts_d * price_d)) / pos["contracts"]
         elif action == "SELL":
-            realized_profit = (price_d - pos["avg_cost"]) * contracts_d
-            st.session_state.paper_realized_pnl += realized_profit
+            st.session_state.paper_realized_pnl += (price_d - pos["avg_cost"]) * contracts_d
             pos["contracts"] -= contracts_d
             if pos["contracts"] <= 0:
                 pos["contracts"] = ZERO
                 pos["avg_cost"] = ZERO
-
         st.session_state.paper_positions[pos_key] = pos
-
         log(f"📝 PAPER {action} {contracts} {outcome} {ticker} @ {outcome_cents}¢")
         trade_entry = {
             "Time": now_utc().strftime("%H:%M:%S"),
@@ -573,7 +514,6 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
         st.session_state.last_order_id = order_id
         st.session_state.last_fill_count = fill_count_value
 
-        # Instantly cache live entry price so stop-loss knows the exact entry price immediately
         if action == "BUY":
             st.session_state.live_entry_prices[pos_key] = D(outcome_cents) / D(100)
         elif action == "SELL":
@@ -638,13 +578,12 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
 
     current = D(current_bid) / D(100)
 
-    # Use instantly cached live entry price if available, avoiding API fill-lag fallback bugs
     pos_key = f"{ticker}_{outcome}"
     if mode == "LIVE TRADING":
         if pos_key in st.session_state.live_entry_prices:
             avg_entry = st.session_state.live_entry_prices[pos_key]
         elif avg_entry is None or avg_entry <= 0:
-            return False  # Wait for valid entry price rather than corrupting with current price
+            return False
 
     if avg_entry is None or avg_entry <= 0:
         return False
@@ -692,7 +631,7 @@ with st.sidebar:
     private_key_text = st.text_area("Private Key PEM", value=private_key_default, height=180)
 
     st.divider()
-    st.header("📊 Market & 200-Tick Memory")
+    st.header("📊 Market & 100-Tick Memory")
     series_ticker = st.text_input("Market Series", value="KXBTC15M")
     display_outcome = st.selectbox("Entry outcome", ["UP", "DOWN", "BOTH (UP & DOWN)"])
     if display_outcome == "UP":
@@ -865,7 +804,6 @@ def run_bot_cycle(client, daily_spent):
         try:
             position_response = client.get_positions(ticker=ticker)
             position = extract_position(position_response, ticker, outcome_target=found_outcome)
-            # Check cached live entry price first, fallback to fill reconstruction if missing
             if pos_key in st.session_state.live_entry_prices:
                 avg_entry = st.session_state.live_entry_prices[pos_key]
             else:
@@ -940,7 +878,7 @@ def run_bot_cycle(client, daily_spent):
 
 @st.fragment(run_every=1)
 def render_dashboard_and_tick():
-    st.subheader("🌪️ Vortex Dashboard & Stop-Loss Tracker")
+    st.subheader("🌪️ Vortex Dashboard & Daily Spend Tracker")
     
     client = None
     daily_spent = ZERO
@@ -1028,7 +966,7 @@ def render_dashboard_and_tick():
         st.info("Vortex is stopped. Choose your settings and press 'START VORTEX'.")
 
     if len(st.session_state.price_history) > 1:
-        st.subheader("📈 200-Tick Historical Price Momentum (Memory Buffer)")
+        st.subheader("📈 100-Tick Historical Price Momentum (Memory Buffer)")
         st.line_chart(st.session_state.price_history, height=200)
 
     if trading_mode == "PAPER TRADING" and any(p["contracts"] > 0 for p in st.session_state.paper_positions.values()):
@@ -1051,7 +989,7 @@ def render_dashboard_and_tick():
     else:
         st.info("No trades executed yet.")
 
-    st.subheader("📜 Vortex Log (Turbo Buffer)")
+    st.subheader("📜 Vortex Log")
     if st.session_state.logs:
         st.code("\n".join(st.session_state.logs[-15:]))
     else:
