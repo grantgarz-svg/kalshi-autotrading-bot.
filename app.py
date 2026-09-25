@@ -25,8 +25,8 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🌪️ Vortex Scalper Pro - Fully Autonomous Engine")
-st.caption("High-frequency Kalshi trading dashboard with universal position management and instant live entry caching")
+st.title("🌪️ Vortex Scalper Pro - Live Streaming 100-Tick Engine")
+st.caption("High-frequency Kalshi trading dashboard with real-time graph streaming and autonomous position management")
 
 
 # ============================================================
@@ -324,13 +324,6 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         
         ask_up = prices["YES"]["ask"]
         ask_down = prices["NO"]["ask"]
-        
-        st.session_state.active_ticker = t
-        st.session_state.up_ask_display = f"{ask_up}¢" if ask_up > 0 else "--"
-        st.session_state.down_ask_display = f"{ask_down}¢" if ask_down > 0 else "--"
-
-        st.session_state.price_history.append(ask_up)
-        st.session_state.price_history = st.session_state.price_history[-200:]
 
         if outcome_mode in ["YES", "BOTH"]:
             if min_up <= ask_up <= max_up:
@@ -388,11 +381,6 @@ def reconstruct_average_entry(fills, ticker, outcome):
         action = str(fill.get("action", "")).upper()
         if action not in ("BUY", "SELL"):
             continue
-        # determine outcome from fill
-        f_outcome = "YES"
-        side = str(fill.get("side", "")).upper()
-        if side == "ASK" and action == "BUY": f_outcome = "NO"
-        
         qty = D(fill.get("count_fp") or fill.get("count") or 0)
         price = D(fill.get("price_dollars") or fill.get("price") or 0)
         if price > 1: price = price / D(100)
@@ -488,7 +476,6 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
             contracts=contracts, price_dollars=book_price, reduce_only=reduce_only,
         )
         order = response.get("order", response)
-        order_id = order.get("order_id")
         
         if action == "BUY":
             st.session_state.live_entry_prices[pos_key] = D(outcome_cents) / D(100)
@@ -525,7 +512,6 @@ def manage_position(client, mode, position, take_profit_pct, stop_loss_pct, enab
 
     current = D(current_bid) / D(100)
 
-    # Determine entry price from cache or fills
     avg_entry = st.session_state.live_entry_prices.get(pos_key)
     if not avg_entry:
         try:
@@ -579,7 +565,7 @@ with st.sidebar:
     private_key_text = st.text_area("Private Key PEM", value=private_key_default, height=180)
 
     st.divider()
-    st.header("📊 Market & 200-Tick Memory")
+    st.header("📊 Market & 100-Tick Memory")
     series_ticker = st.text_input("Market Series", value="KXBTC15M")
     display_outcome = st.selectbox("Entry outcome", ["UP", "DOWN", "BOTH (UP & DOWN)"])
     outcome_mode = "YES" if display_outcome == "UP" else ("NO" if display_outcome == "DOWN" else "BOTH")
@@ -651,7 +637,7 @@ with c1:
                     pass
             st.session_state.running = True
             st.session_state.emergency_stop = False
-            log(f"Vortex Scalper Pro fully autonomous mode started ({trading_mode}).")
+            log(f"Vortex Scalper Pro live-streaming mode started ({trading_mode}).")
             st.rerun()
 
 with c2:
@@ -695,7 +681,6 @@ def run_bot_cycle(client, daily_spent):
         st.rerun()
         return
 
-    # 1. UNIVERSAL POSITION CHECK: Manage ALL active positions across the account first
     try:
         if trading_mode == "LIVE TRADING":
             pos_res = client.get_positions()
@@ -715,11 +700,10 @@ def run_bot_cycle(client, daily_spent):
             )
             if exited:
                 st.session_state.last_trade_time = now_utc()
-                return # Exit cycle to prioritize position management
+                return
     except Exception as e:
         log(f"⚠️ Position management sweep error: {e}")
 
-    # If we currently hold any positions, hold off on opening new ones
     if trading_mode == "PAPER TRADING":
         if any(p["contracts"] > 0 for p in st.session_state.paper_positions.values()):
             return
@@ -730,7 +714,6 @@ def run_bot_cycle(client, daily_spent):
         except Exception:
             pass
 
-    # 2. ENTRY SCANNER: Look for new scalp opportunities
     try:
         market, found_outcome, entry_price = find_active_market_with_liquidity(
             client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), 
@@ -749,7 +732,6 @@ def run_bot_cycle(client, daily_spent):
     if pos_key in st.session_state.blacklisted_tickers:
         return
 
-    # Entry filters validation
     signal = True
     prices = get_both_prices(client, ticker)
     if not prices: return
@@ -781,12 +763,12 @@ def run_bot_cycle(client, daily_spent):
 
 
 # ============================================================
-# TURBO-OPTIMIZED 1-SECOND MONITORING LOOP
+# TURBO-OPTIMIZED 1-SECOND MONITORING LOOP & LIVE GRAPH FEED
 # ============================================================
 
 @st.fragment(run_every=1)
 def render_dashboard_and_tick():
-    st.subheader("🌪️ Vortex Dashboard & Autonomous Engine")
+    st.subheader("🌪️ Vortex Dashboard & Live Streaming Engine")
     
     client = None
     daily_spent = ZERO
@@ -822,8 +804,14 @@ def render_dashboard_and_tick():
                 p_sample = get_both_prices(client, t_sample)
                 if p_sample:
                     st.session_state.active_ticker = t_sample
-                    st.session_state.up_ask_display = f"{p_sample['YES']['ask']}¢" if p_sample['YES']['ask'] > 0 else "--"
+                    ask_up = p_sample['YES']['ask']
+                    st.session_state.up_ask_display = f"{ask_up}¢" if ask_up > 0 else "--"
                     st.session_state.down_ask_display = f"{p_sample['NO']['ask']}¢" if p_sample['NO']['ask'] > 0 else "--"
+                    
+                    # Stream live prices directly into the 100-tick buffer every second
+                    if ask_up > 0:
+                        st.session_state.price_history.append(ask_up)
+                        st.session_state.price_history = st.session_state.price_history[-100:]
         except Exception:
             pass
 
@@ -858,10 +846,10 @@ def render_dashboard_and_tick():
     if st.session_state.running and client:
         run_bot_cycle(client, daily_spent)
     elif not st.session_state.running:
-        st.info("Vortex is stopped. Choose your settings and press 'START VORTEX'.")
+        st.info("Vortex is stopped. Enter your API credentials to stream live market data.")
 
     if len(st.session_state.price_history) > 1:
-        st.subheader("📈 200-Tick Historical Price Momentum (Memory Buffer)")
+        st.subheader("📈 Live Streaming 100-Tick Price Momentum")
         st.line_chart(st.session_state.price_history, height=200)
 
     st.subheader("🛒 Execution Log")
