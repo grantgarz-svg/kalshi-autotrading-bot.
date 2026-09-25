@@ -20,13 +20,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 # ============================================================
 
 st.set_page_config(
-    page_title="KX Scalper Pro (Position Detection Fix)",
-    page_icon="⚡",
+    page_title="Vortex Scalper Pro",
+    page_icon="🌪️",
     layout="wide",
 )
 
-st.title("⚡ KX Scalper Pro - Bulletproof Position Detection & ROI Exits")
-st.caption("High-frequency Kalshi trading dashboard with robust position tracking and exact return percentage exits")
+st.title("🌪️ Vortex Scalper Pro - ROI Exits & Bulletproof Stop-Loss")
+st.caption("High-frequency Kalshi trading dashboard with exact return percentage tracking and error-logged stop-losses")
 
 
 # ============================================================
@@ -492,7 +492,7 @@ def calculate_daily_spend(client):
 
 
 def make_client_order_id():
-    return f"ksbot-{uuid.uuid4().hex}"
+    return f"vortex-{uuid.uuid4().hex}"
 
 
 def calculate_contracts(max_dollars, price_cents, remaining_daily):
@@ -618,11 +618,14 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
         mins_left = market_minutes_remaining(market)
 
         prices = get_both_prices(client, ticker)
-        if not prices: return False
+        if not prices: 
+            log(f"⚠️ Warning: Could not fetch prices for {ticker} during exit check.")
+            return False
         current_bid = prices[outcome]["bid"]
         if current_bid <= 0:
             return False
-    except Exception:
+    except Exception as e:
+        log(f"⚠️ Exit check API error for {ticker}: {e}")
         return False
 
     current = D(current_bid) / D(100)
@@ -630,7 +633,6 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
     if avg_entry is None or avg_entry <= 0:
         avg_entry = current
 
-    # Calculate exact ROI percentage matching the Kalshi mobile app (+X.XX%)
     roi_pct = ((current - avg_entry) / avg_entry) * D(100)
 
     reason = None
@@ -644,7 +646,7 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
     if reason is None:
         return False
 
-    log(f"🚨 {mode} {reason}: {ticker} {outcome} entry=${avg_entry:.4f}, bid=${current:.4f}")
+    log(f"🌪️ VORTEX {reason}: {ticker} {outcome} entry=${avg_entry:.4f}, bid=${current:.4f}")
     submit_trade(
         client=client, mode=mode, ticker=ticker, outcome=outcome,
         action="SELL", contracts=contracts, outcome_cents=current_bid, reduce_only=True,
@@ -749,7 +751,7 @@ if trading_mode == "LIVE TRADING":
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    if st.button("▶ START AUTOTRADING", type="primary", use_container_width=True):
+    if st.button("▶ START VORTEX", type="primary", use_container_width=True):
         if not key_id:
             st.error("Enter your Kalshi API Key ID.")
         elif not private_key_text:
@@ -768,20 +770,20 @@ with c1:
                         target_shard = 2
                         if total_cents > 0:
                             auto_client.intra_exchange_transfer(amount_cents=total_cents, source_shard=0, dest_shard=target_shard)
-                            log(f"⚡ Transferred {total_cents} cents to Crypto Shard {target_shard}!")
+                            log(f"🌪️ Transferred {total_cents} cents to Crypto Shard {target_shard}!")
                     time.sleep(1)
                 except Exception as e:
                     pass
 
             st.session_state.running = True
             st.session_state.emergency_stop = False
-            log(f"Bot started with Robust Position Tracking ({trading_mode}).")
+            log(f"Vortex Scalper Pro started ({trading_mode}).")
             st.rerun()
 
 with c2:
     if st.button("⏹ STOP", use_container_width=True):
         st.session_state.running = False
-        log("Bot stopped.")
+        log("Vortex stopped.")
         st.rerun()
 
 with c3:
@@ -898,7 +900,7 @@ def run_bot_cycle(client, daily_spent):
         contracts = calculate_contracts(D(max_dollars_trade), entry_price, remaining_daily)
 
         if contracts > 0:
-            log(f"⚡ MEMORY VERIFIED SIGNAL: BUY {contracts} {found_outcome} {ticker} @ {entry_price}¢")
+            log(f"🌪️ VORTEX SIGNAL: BUY {contracts} {found_outcome} {ticker} @ {entry_price}¢")
             try:
                 submit_trade(
                     client=client, mode=trading_mode, ticker=ticker, outcome=found_outcome,
@@ -915,7 +917,7 @@ def run_bot_cycle(client, daily_spent):
 
 @st.fragment(run_every=1)
 def render_dashboard_and_tick():
-    st.subheader("Dashboard & Position Scanner")
+    st.subheader("🌪️ Vortex Dashboard & Scanner")
     
     client = None
     daily_spent = ZERO
@@ -998,7 +1000,7 @@ def render_dashboard_and_tick():
     if st.session_state.running and client:
         run_bot_cycle(client, daily_spent)
     elif not st.session_state.running:
-        st.info("Bot is stopped. Choose your settings and press 'START AUTOTRADING'.")
+        st.info("Vortex is stopped. Choose your settings and press 'START VORTEX'.")
 
     if len(st.session_state.price_history) > 1:
         st.subheader("📈 Smooth Historical Price Momentum (Memory Buffer)")
@@ -1024,10 +1026,10 @@ def render_dashboard_and_tick():
     else:
         st.info("No trades executed yet.")
 
-    st.subheader("📜 Bot Log (Turbo Buffer)")
+    st.subheader("📜 Vortex Log (Turbo Buffer)")
     if st.session_state.logs:
         st.code("\n".join(st.session_state.logs[-15:]))
     else:
-        st.info("Waiting for bot activity...")
+        st.info("Waiting for Vortex activity...")
 
 render_dashboard_and_tick()
