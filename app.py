@@ -25,8 +25,8 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🌪️ Vortex Scalper Pro - Direct Execution Engine")
-st.caption("High-frequency Kalshi trading dashboard with clean, direct trade execution and 100-tick streaming buffer")
+st.title("🌪️ Vortex Scalper Pro - Bulletproof Stop-Loss & Daily Tracker")
+st.caption("High-frequency Kalshi trading dashboard with instant live entry caching and error-logged stop-losses")
 
 
 # ============================================================
@@ -52,7 +52,7 @@ DEFAULTS = {
     "paper_trades": [],
     "paper_positions": {},      
     "paper_realized_pnl": ZERO, 
-    "live_entry_prices": {},    
+    "live_entry_prices": {},    # Instant cache for live fill entry prices
     "starting_live_balance": None,
     "last_trade_time": None,
     "active_ticker": None,
@@ -93,7 +93,7 @@ def log(message):
     stamp = now_utc().strftime("%H:%M:%S")
     line = f"[{stamp}] {message}"
     st.session_state.logs.append(line)
-    st.session_state.logs = st.session_state.logs[-40:]
+    st.session_state.logs = st.session_state.logs[-30:]
 
 def log_once(msg_key, message):
     if st.session_state.get("last_status_log") != msg_key:
@@ -295,17 +295,16 @@ def evaluate_historical_memory(price_history, intended_outcome):
     recent = price_history[-20:]
     momentum = recent[-1] - recent[0]
     if intended_outcome == "YES":
-        return momentum >= -5
+        return momentum >= -3
     else:
-        return momentum <= 5
+        return momentum <= 3
 
 
-def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, outcome_mode="YES", min_up=1, max_up=99, min_down=1, max_down=99, use_memory_filter=True):
+def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, outcome_mode="YES", min_up=15, max_up=65, min_down=15, max_down=65, use_memory_filter=True):
     try:
         res = client.get_markets(series_ticker=series_ticker, limit=30)
         markets = res.get("markets", [])
-    except Exception as e:
-        log(f"⚠️ API Error fetching markets: {e}")
+    except Exception:
         return None, None, 0
 
     open_markets = [m for m in markets if str(m.get("status", "")).lower() not in ("closed", "settled", "finalized")]
@@ -315,7 +314,6 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         valid_markets = [m for m in open_markets if market_minutes_remaining(m) is not None and market_minutes_remaining(m) > 0]
 
     if not valid_markets:
-        log_once("no_markets", f"⚠️ No open valid markets found for series {series_ticker}")
         return None, None, 0
 
     for m in valid_markets:
@@ -331,27 +329,18 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         st.session_state.up_ask_display = f"{ask_up}¢" if ask_up > 0 else "--"
         st.session_state.down_ask_display = f"{ask_down}¢" if ask_down > 0 else "--"
 
-        if ask_up > 0:
-            st.session_state.price_history.append(ask_up)
-            st.session_state.price_history = st.session_state.price_history[-100:]
+        st.session_state.price_history.append(ask_up)
+        st.session_state.price_history = st.session_state.price_history[-200:]
 
         if outcome_mode in ["YES", "BOTH"]:
             if min_up <= ask_up <= max_up:
-                if use_memory_filter and not evaluate_historical_memory(st.session_state.price_history, "YES"):
-                    log_once(f"mem_skip_{t}", f"⏳ Skipping {t} (UP): Memory momentum filter blocked trade.")
-                    continue
-                return m, "YES", ask_up
-            else:
-                log_once(f"range_skip_up_{t}", f"🔍 Scanning {t}: UP Ask {ask_up}¢ outside range [{min_up}, {max_up}]¢")
+                if not use_memory_filter or evaluate_historical_memory(st.session_state.price_history, "YES"):
+                    return m, "YES", ask_up
 
         if outcome_mode in ["NO", "BOTH"]:
             if min_down <= ask_down <= max_down:
-                if use_memory_filter and not evaluate_historical_memory(st.session_state.price_history, "NO"):
-                    log_once(f"mem_skip_down_{t}", f"⏳ Skipping {t} (DOWN): Memory momentum filter blocked trade.")
-                    continue
-                return m, "NO", ask_down
-            else:
-                log_once(f"range_skip_down_{t}", f"🔍 Scanning {t}: DOWN Ask {ask_down}¢ outside range [{min_down}, {max_down}]¢")
+                if not use_memory_filter or evaluate_historical_memory(st.session_state.price_history, "NO"):
+                    return m, "NO", ask_down
 
         time.sleep(0.02)
 
@@ -383,6 +372,7 @@ def extract_position(positions_response, ticker, outcome_target=None):
         if raw is None:
             raw = row.get("count") or row.get("balance") or 0
         position = D(raw)
+        
         row_outcome = str(row.get("outcome", row.get("side", ""))).upper()
         
         if position > 0:
@@ -397,37 +387,86 @@ def extract_position(positions_response, ticker, outcome_target=None):
     return {"ticker": ticker, "outcome": None, "contracts": ZERO}
 
 
+def fill_outcome(fill):
+    action = str(fill.get("action", "")).upper()
+    for key in ["outcome_side", "outcome", "side_target"]:
+        if fill.get(key):
+            val = str(fill[key]).upper()
+            if val in ("YES", "NO"): return val
+            
+    side = str(fill.get("side", "")).upper()
+    if side in ("YES", "NO"): return side
+    
+    if action == "BUY":
+        if side == "BID": return "YES"
+        if side == "ASK": return "NO"
+    elif action == "SELL":
+        if side == "ASK": return "YES"
+        if side == "BID": return "NO"
+        
+    return None
+
+
+def fill_price(fill, outcome):
+    keys_to_try = []
+    if outcome == "YES":
+        keys_to_try = ["yes_price_dollars", "yes_price", "price_dollars", "price"]
+    else:
+        keys_to_try = ["no_price_dollars", "no_price", "price_dollars", "price"]
+        
+    for k in keys_to_try:
+        if fill.get(k) is not None:
+            val = D(fill.get(k))
+            if val > 1: return val / D(100)
+            return val
+            
+    return ZERO
+
+
+def fill_count(fill):
+    raw = fill.get("count_fp") or fill.get("count") or fill.get("filled_count_fp") or fill.get("filled_count")
+    return D(raw)
+
+
 def reconstruct_average_entry(fills, ticker, outcome):
     relevant = []
     for fill in fills:
         if fill.get("ticker") and fill.get("ticker") != ticker:
             continue
+        f_outcome = fill_outcome(fill)
+        if f_outcome != outcome:
+            continue
         action = str(fill.get("action", "")).upper()
         if action not in ("BUY", "SELL"):
             continue
-        qty = D(fill.get("count_fp") or fill.get("count") or 0)
-        price = D(fill.get("price_dollars") or fill.get("price") or 0)
-        if price > 1: price = price / D(100)
-        if qty <= 0 or price <= 0: continue
-        relevant.append((str(fill.get("created_time", "")), action, qty, price))
+        qty = fill_count(fill)
+        price = fill_price(fill, outcome)
+        if qty <= 0 or price <= 0:
+            continue
+        created = fill.get("created_time") or fill.get("ts") or ""
+        relevant.append((str(created), action, qty, price))
 
     relevant.sort(key=lambda x: x[0])
     lots = []
     for _, action, qty, price in relevant:
         if action == "BUY":
             lots.append([qty, price])
-        else:
-            remaining = qty
-            while remaining > 0 and lots:
-                l_qty, l_price = lots[0]
-                take = min(remaining, l_qty)
-                lots[0][0] -= take
-                remaining -= take
-                if lots[0][0] <= 0: lots.pop(0)
+            continue
+        remaining = qty
+        while remaining > 0 and lots:
+            lot_qty, lot_price = lots[0]
+            take = min(remaining, lot_qty)
+            lot_qty -= take
+            remaining -= take
+            if lot_qty <= 0:
+                lots.pop(0)
+            else:
+                lots[0][0] = lot_qty
 
-    total_qty = sum((l[0] for l in lots), ZERO)
-    if total_qty <= 0: return None
-    total_cost = sum((l[0] * l[1] for l in lots), ZERO)
+    total_qty = sum((lot[0] for lot in lots), ZERO)
+    if total_qty <= 0:
+        return None
+    total_cost = sum((lot_qty * lot_price for lot_qty, lot_price in lots), ZERO)
     return total_cost / total_qty
 
 
@@ -443,9 +482,11 @@ def calculate_daily_spend(client):
     for fill in fills:
         if str(fill.get("action", "")).lower() != "buy":
             continue
-        qty = D(fill.get("count_fp") or fill.get("count") or 0)
-        price = D(fill.get("price_dollars") or fill.get("price") or 0)
-        if price > 1: price = price / D(100)
+        outcome = fill_outcome(fill)
+        if outcome not in ("YES", "NO"):
+            continue
+        qty = fill_count(fill)
+        price = fill_price(fill, outcome)
         fee = D(fill.get("fee_cost", 0))
         total += (qty * price) + fee
     return total
@@ -472,32 +513,51 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
     client_order_id = make_client_order_id()
     
     st.session_state.last_client_order_id = client_order_id
+
     pos_key = f"{ticker}_{outcome}"
 
     if mode == "PAPER TRADING":
         contracts_d = D(contracts)
         price_d = D(outcome_cents) / D(100)
+        
         if pos_key not in st.session_state.paper_positions:
             st.session_state.paper_positions[pos_key] = {"contracts": ZERO, "avg_cost": ZERO, "ticker": ticker, "outcome": outcome}
+            
         pos = st.session_state.paper_positions[pos_key]
+
         if action == "BUY":
             total_current_cost = pos["contracts"] * pos["avg_cost"]
+            new_cost = contracts_d * price_d
             pos["contracts"] += contracts_d
-            pos["avg_cost"] = (total_current_cost + (contracts_d * price_d)) / pos["contracts"]
+            pos["avg_cost"] = (total_current_cost + new_cost) / pos["contracts"]
         elif action == "SELL":
-            st.session_state.paper_realized_pnl += (price_d - pos["avg_cost"]) * contracts_d
+            realized_profit = (price_d - pos["avg_cost"]) * contracts_d
+            st.session_state.paper_realized_pnl += realized_profit
             pos["contracts"] -= contracts_d
             if pos["contracts"] <= 0:
                 pos["contracts"] = ZERO
                 pos["avg_cost"] = ZERO
+
         st.session_state.paper_positions[pos_key] = pos
+
         log(f"📝 PAPER {action} {contracts} {outcome} {ticker} @ {outcome_cents}¢")
-        st.session_state.trade_logs.append({
-            "Time": now_utc().strftime("%H:%M:%S"), "Mode": mode, "Action": action,
-            "Outcome": outcome, "Ticker": ticker, "Contracts": contracts,
-            "Price": f"{outcome_cents}¢", "Cost/Value": f"${estimated_cost:.2f}", "Status": "Filled"
-        })
-        return {"status": "paper_fill"}
+        trade_entry = {
+            "Time": now_utc().strftime("%H:%M:%S"),
+            "Mode": mode,
+            "Action": action,
+            "Outcome": outcome,
+            "Ticker": ticker,
+            "Contracts": contracts,
+            "Price": f"{outcome_cents}¢",
+            "Cost/Value": f"${estimated_cost:.2f}",
+            "Status": "Filled"
+        }
+        st.session_state.trade_logs.append(trade_entry)
+        st.session_state.paper_trades.append(trade_entry)
+        return {
+            "order_id": "PAPER", "client_order_id": client_order_id,
+            "fill_count": D(contracts), "remaining_count": ZERO, "status": "paper_fill",
+        }
 
     try:
         response = client.create_v2_order(
@@ -505,32 +565,60 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
             contracts=contracts, price_dollars=book_price, reduce_only=reduce_only,
         )
         order = response.get("order", response)
-        
+        order_id = order.get("order_id")
+        fill_count_value = D(order.get("fill_count") or order.get("fill_count_fp"))
+        remaining = D(order.get("remaining_count") or order.get("remaining_count_fp"))
+        status = order.get("status", "submitted")
+
+        st.session_state.last_order_id = order_id
+        st.session_state.last_fill_count = fill_count_value
+
+        # Instantly cache live entry price so stop-loss knows the exact entry price immediately
         if action == "BUY":
             st.session_state.live_entry_prices[pos_key] = D(outcome_cents) / D(100)
         elif action == "SELL":
             st.session_state.live_entry_prices.pop(pos_key, None)
 
-        log(f"🟢 LIVE ORDER {action}: {contracts} {outcome} {ticker} @ {outcome_cents}¢")
-        st.session_state.trade_logs.append({
-            "Time": now_utc().strftime("%H:%M:%S"), "Mode": mode, "Action": action,
-            "Outcome": outcome, "Ticker": ticker, "Contracts": contracts,
-            "Price": f"{outcome_cents}¢", "Cost/Value": f"${estimated_cost:.2f}", "Status": order.get("status", "submitted")
+        append_order_log({
+            "timestamp": now_utc().isoformat(), "mode": mode, "ticker": ticker,
+            "outcome": outcome, "action": action, "book_side": book_side,
+            "contracts": contracts, "price": f"{book_price:.4f}",
+            "estimated_cost": f"{estimated_cost:.4f}", "order_id": order_id or "",
+            "client_order_id": client_order_id, "fill_count": f"{fill_count_value:.2f}",
+            "remaining_count": f"{remaining:.2f}", "status": status, "error": "",
         })
-        return {"status": order.get("status", "submitted")}
+        log(f"🟢 LIVE ORDER {action}: {contracts} {outcome} {ticker} @ {outcome_cents}¢")
+        
+        st.session_state.trade_logs.append({
+            "Time": now_utc().strftime("%H:%M:%S"),
+            "Mode": mode,
+            "Action": action,
+            "Outcome": outcome,
+            "Ticker": ticker,
+            "Contracts": contracts,
+            "Price": f"{outcome_cents}¢",
+            "Cost/Value": f"${estimated_cost:.2f}",
+            "Status": status
+        })
+
+        return {
+            "order_id": order_id, "client_order_id": client_order_id,
+            "fill_count": fill_count_value, "remaining_count": remaining, "status": status,
+        }
     except Exception as error:
         log(f"❌ LIVE ORDER FAILED: {error}")
         raise
 
 
-def manage_position(client, mode, position, take_profit_pct, stop_loss_pct, enable_panic, panic_mins):
+def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_loss_pct, enable_panic, panic_mins):
+    if position["contracts"] <= 0:
+        return False
+
     ticker = position["ticker"]
     outcome = position["outcome"]
     contracts = int(position["contracts"])
-    if contracts <= 0 or not ticker:
+    if outcome not in ("YES", "NO"):
         return False
-
-    pos_key = f"{ticker}_{outcome}"
 
     try:
         market_data = client.get_market(ticker)
@@ -538,25 +626,27 @@ def manage_position(client, mode, position, take_profit_pct, stop_loss_pct, enab
         mins_left = market_minutes_remaining(market)
 
         prices = get_both_prices(client, ticker)
-        if not prices: return False
+        if not prices: 
+            log(f"⚠️ Warning: Could not fetch prices for {ticker} during exit check.")
+            return False
         current_bid = prices[outcome]["bid"]
-        if current_bid <= 0: return False
-    except Exception:
+        if current_bid <= 0:
+            return False
+    except Exception as e:
+        log(f"⚠️ Exit check API error for {ticker}: {e}")
         return False
 
     current = D(current_bid) / D(100)
 
-    avg_entry = st.session_state.live_entry_prices.get(pos_key)
-    if not avg_entry:
-        try:
-            fills_res = client.get_fills(ticker=ticker)
-            avg_entry = reconstruct_average_entry(fills_res.get("fills", []), ticker, outcome)
-            if avg_entry:
-                st.session_state.live_entry_prices[pos_key] = avg_entry
-        except Exception:
-            pass
+    # Use instantly cached live entry price if available, avoiding API fill-lag fallback bugs
+    pos_key = f"{ticker}_{outcome}"
+    if mode == "LIVE TRADING":
+        if pos_key in st.session_state.live_entry_prices:
+            avg_entry = st.session_state.live_entry_prices[pos_key]
+        elif avg_entry is None or avg_entry <= 0:
+            return False  # Wait for valid entry price rather than corrupting with current price
 
-    if not avg_entry or avg_entry <= 0:
+    if avg_entry is None or avg_entry <= 0:
         return False
 
     roi_pct = ((current - avg_entry) / avg_entry) * D(100)
@@ -578,8 +668,11 @@ def manage_position(client, mode, position, take_profit_pct, stop_loss_pct, enab
         action="SELL", contracts=contracts, outcome_cents=current_bid, reduce_only=True,
     )
 
-    st.session_state.blacklisted_tickers.add(pos_key)
-    st.session_state.live_entry_prices.pop(pos_key, None)
+    if reason.startswith(("STOP LOSS", "TIME PANIC EXIT", "TAKE PROFIT")):
+        st.session_state.blacklisted_tickers.add(pos_key)
+        st.session_state.live_entry_prices.pop(pos_key, None)
+        st.session_state["last_status_log"] = None 
+
     return True
 
 
@@ -599,10 +692,16 @@ with st.sidebar:
     private_key_text = st.text_area("Private Key PEM", value=private_key_default, height=180)
 
     st.divider()
-    st.header("📊 Market & 100-Tick Memory")
+    st.header("📊 Market & 200-Tick Memory")
     series_ticker = st.text_input("Market Series", value="KXBTC15M")
     display_outcome = st.selectbox("Entry outcome", ["UP", "DOWN", "BOTH (UP & DOWN)"])
-    outcome_mode = "YES" if display_outcome == "UP" else ("NO" if display_outcome == "DOWN" else "BOTH")
+    if display_outcome == "UP":
+        outcome_mode = "YES"
+    elif display_outcome == "DOWN":
+        outcome_mode = "NO"
+    else:
+        outcome_mode = "BOTH"
+        
     use_memory_filter = st.checkbox("🧠 Enable Historical Memory Filter", value=True)
 
     st.divider()
@@ -610,8 +709,24 @@ with st.sidebar:
     max_dollars_trade = st.number_input("Maximum dollars per trade", min_value=0.01, max_value=10000.00, value=1.00, step=0.50)
     daily_cap = st.number_input("Daily spending cap", min_value=0.01, max_value=100000.00, value=3.00, step=1.00)
     
-    min_entry_up, max_entry_up = st.slider("Min/Max UP", 1, 99, (15, 65))
-    min_entry_down, max_entry_down = st.slider("Min/Max DOWN", 1, 99, (15, 65))
+    min_entry_up, max_entry_up = 15, 65
+    min_entry_down, max_entry_down = 15, 65
+
+    if display_outcome in ["UP", "BOTH (UP & DOWN)"]:
+        st.subheader("🟢 UP (YES) Entry Limits")
+        c1, c2 = st.columns(2)
+        with c1:
+            min_entry_up = st.slider("Min UP", 1, 99, 15, format="%d¢", key="min_up")
+        with c2:
+            max_entry_up = st.slider("Max UP", 1, 99, 65, format="%d¢", key="max_up")
+
+    if display_outcome in ["DOWN", "BOTH (UP & DOWN)"]:
+        st.subheader("🔴 DOWN (NO) Entry Limits")
+        c3, c4 = st.columns(2)
+        with c3:
+            min_entry_down = st.slider("Min DOWN", 1, 99, 15, format="%d¢", key="min_down")
+        with c4:
+            max_entry_down = st.slider("Max DOWN", 1, 99, 65, format="%d¢", key="max_down")
         
     max_spread = st.slider("Max Bid/Ask Spread", min_value=1, max_value=50, value=5, format="%d¢")
     cooldown = st.slider("Cooldown between entries", min_value=10, max_value=1800, value=45, step=5, format="%d seconds")
@@ -628,8 +743,10 @@ with st.sidebar:
     st.divider()
     st.header("🕐 Trading Hours")
     c1, c2 = st.columns(2)
-    with c1: start_time = st.time_input("Start", dt.time(0, 0))
-    with c2: end_time = st.time_input("End", dt.time(23, 59))
+    with c1:
+        start_time = st.time_input("Start", dt.time(0, 0))
+    with c2:
+        end_time = st.time_input("End", dt.time(23, 59))
 
 
 # ============================================================
@@ -652,8 +769,10 @@ if trading_mode == "LIVE TRADING":
 c1, c2, c3 = st.columns(3)
 with c1:
     if st.button("▶ START VORTEX", type="primary", use_container_width=True):
-        if not key_id or not private_key_text:
-            st.error("Enter API credentials.")
+        if not key_id:
+            st.error("Enter your Kalshi API Key ID.")
+        elif not private_key_text:
+            st.error("Provide the private key.")
         elif trading_mode == "LIVE TRADING" and not live_confirmed:
             st.error("Live confirmation required.")
         else:
@@ -663,15 +782,19 @@ with c1:
                     bal_data = auto_client.get_balance()
                     total_cents = int(bal_data.get("balance", 0))
                     st.session_state.starting_live_balance = D(total_cents) / D(100)
+                    
                     if "KXBTC" in series_ticker.upper() or "CRYPTO" in series_ticker.upper():
+                        target_shard = 2
                         if total_cents > 0:
-                            auto_client.intra_exchange_transfer(amount_cents=total_cents, source_shard=0, dest_shard=2)
+                            auto_client.intra_exchange_transfer(amount_cents=total_cents, source_shard=0, dest_shard=target_shard)
+                            log(f"🌪️ Transferred {total_cents} cents to Crypto Shard {target_shard}!")
                     time.sleep(1)
-                except Exception:
+                except Exception as e:
                     pass
+
             st.session_state.running = True
             st.session_state.emergency_stop = False
-            log(f"Vortex Scalper Pro direct execution mode started ({trading_mode}).")
+            log(f"Vortex Scalper Pro started ({trading_mode}).")
             st.rerun()
 
 with c2:
@@ -692,7 +815,7 @@ if st.session_state.emergency_stop:
 
 
 # ============================================================
-# BOT ENGINE LOOP (DIRECT EXECUTION FLOW)
+# BOT ENGINE LOOP
 # ============================================================
 
 def run_bot_cycle(client, daily_spent):
@@ -711,7 +834,6 @@ def run_bot_cycle(client, daily_spent):
         return
 
     if daily_spent >= D(daily_cap):
-        log_once("daily_cap_reached", f"🛑 Daily spending cap reached (${daily_spent:.2f} / ${daily_cap:.2f}). Stopping bot.")
         st.session_state.running = False
         st.rerun()
         return
@@ -720,39 +842,59 @@ def run_bot_cycle(client, daily_spent):
         market, found_outcome, entry_price = find_active_market_with_liquidity(
             client, series_ticker, min_expiry_mins=float(min_minutes_to_expiry), 
             outcome_mode=outcome_mode, 
-            min_up=min_entry_up[0], max_up=min_entry_up[1], 
-            min_down=min_entry_down[0], max_down=min_entry_down[1],
+            min_up=min_entry_up, max_up=max_entry_up, 
+            min_down=min_entry_down, max_down=max_entry_down,
             use_memory_filter=use_memory_filter
         )
+
         if not market or entry_price <= 0 or entry_price >= 100:
             return
+
         ticker = market.get("ticker")
-    except Exception as e:
-        log(f"⚠️ Market search error: {e}")
+    except Exception:
         return
 
     pos_key = f"{ticker}_{found_outcome}"
     if pos_key in st.session_state.blacklisted_tickers:
         return
 
-    # Check position for current target market directly
     position = {"contracts": ZERO}
+    avg_entry = None
+
     if trading_mode == "LIVE TRADING":
         try:
-            pos_res = client.get_positions(ticker=ticker)
-            position = extract_position(pos_res, ticker, outcome_target=found_outcome)
+            position_response = client.get_positions(ticker=ticker)
+            position = extract_position(position_response, ticker, outcome_target=found_outcome)
+            # Check cached live entry price first, fallback to fill reconstruction if missing
+            if pos_key in st.session_state.live_entry_prices:
+                avg_entry = st.session_state.live_entry_prices[pos_key]
+            else:
+                fills_response = client.get_fills(ticker=ticker)
+                fills = fills_response.get("fills", [])
+                avg_entry = reconstruct_average_entry(fills, ticker, found_outcome)
+                if avg_entry:
+                    st.session_state.live_entry_prices[pos_key] = avg_entry
         except Exception:
-            pass
+            return
     else:
-        p_pos = st.session_state.paper_positions.get(pos_key, {"contracts": ZERO})
+        p_pos = st.session_state.paper_positions.get(pos_key, {"contracts": ZERO, "avg_cost": ZERO, "outcome": found_outcome})
         position = {"ticker": ticker, "outcome": found_outcome, "contracts": p_pos["contracts"]}
+        avg_entry = p_pos["avg_cost"] if p_pos["contracts"] > 0 else None
 
     if position["contracts"] > 0:
-        manage_position(
-            client=client, mode=trading_mode, position=position,
-            take_profit_pct=take_profit_pct, stop_loss_pct=stop_loss_pct,
-            enable_panic=enable_panic_exit, panic_mins=panic_minutes_threshold
-        )
+        try:
+            exited = manage_position(
+                client, trading_mode, position, avg_entry, 
+                take_profit_pct, stop_loss_pct, 
+                enable_panic_exit, panic_minutes_threshold
+            )
+            if exited:
+                st.session_state.last_trade_time = now_utc()
+                return
+        except Exception:
+            return
+
+    if position["contracts"] > 0:
         return
 
     signal = True
@@ -761,8 +903,14 @@ def run_bot_cycle(client, daily_spent):
     live_bid = prices[found_outcome]["bid"]
     spread = entry_price - live_bid
 
-    if spread > max_spread:
-        log_once(f"spread_skip_{ticker}", f"⏳ Skipping {ticker}: Spread ({spread}¢) exceeds max allowed ({max_spread}¢).")
+    cur_min = min_entry_up if found_outcome == "YES" else min_entry_down
+    cur_max = max_entry_up if found_outcome == "YES" else max_entry_up
+
+    if not (cur_min <= entry_price <= cur_max):
+        signal = False
+    elif spread > max_spread:
+        signal = False
+    elif live_bid <= (entry_price * (1 - stop_loss_pct / 100)):
         signal = False
     elif st.session_state.last_trade_time:
         elapsed = (now_utc() - st.session_state.last_trade_time).total_seconds()
@@ -787,12 +935,12 @@ def run_bot_cycle(client, daily_spent):
 
 
 # ============================================================
-# TURBO-OPTIMIZED 1-SECOND MONITORING LOOP & LIVE GRAPH FEED
+# TURBO-OPTIMIZED 1-SECOND MONITORING LOOP
 # ============================================================
 
 @st.fragment(run_every=1)
 def render_dashboard_and_tick():
-    st.subheader("🌪️ Vortex Dashboard & Direct Engine")
+    st.subheader("🌪️ Vortex Dashboard & Stop-Loss Tracker")
     
     client = None
     daily_spent = ZERO
@@ -828,13 +976,8 @@ def render_dashboard_and_tick():
                 p_sample = get_both_prices(client, t_sample)
                 if p_sample:
                     st.session_state.active_ticker = t_sample
-                    ask_up = p_sample['YES']['ask']
-                    st.session_state.up_ask_display = f"{ask_up}¢" if ask_up > 0 else "--"
+                    st.session_state.up_ask_display = f"{p_sample['YES']['ask']}¢" if p_sample['YES']['ask'] > 0 else "--"
                     st.session_state.down_ask_display = f"{p_sample['NO']['ask']}¢" if p_sample['NO']['ask'] > 0 else "--"
-                    
-                    if ask_up > 0:
-                        st.session_state.price_history.append(ask_up)
-                        st.session_state.price_history = st.session_state.price_history[-100:]
         except Exception:
             pass
 
@@ -857,23 +1000,50 @@ def render_dashboard_and_tick():
                         current_val = D(current_bid_cents) / D(100)
                         paper_unrealized += (current_val - p_data["avg_cost"]) * p_data["contracts"]
 
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    with c1: st.metric("Mode", trading_mode)
-    with c2: st.metric("Realized P/L" if trading_mode=="PAPER TRADING" else "Live P/L", f"${st.session_state.paper_realized_pnl if trading_mode=='PAPER TRADING' else live_pnl:.2f}")
-    with c3: st.metric("Unrealized P/L" if trading_mode=="PAPER TRADING" else "Live Balance", f"${paper_unrealized if trading_mode=='PAPER TRADING' else live_bal:.2f}")
-    with c4: st.metric("Daily Spent", f"${daily_spent:.2f} / ${daily_cap:.2f}")
-    with c5: st.metric("Active Market", st.session_state.active_ticker or "--")
-    with c6: st.metric("🟢 UP Ask", st.session_state.up_ask_display)
-    with c7: st.metric("🔴 DOWN Ask", st.session_state.down_ask_display)
+    c_dash1, c_dash2, c_dash3, c_dash4, c_dash5, c_dash6, c_dash7 = st.columns(7)
+    with c_dash1:
+        st.metric("Mode", trading_mode)
+    with c_dash2:
+        if trading_mode == "PAPER TRADING":
+            st.metric("Realized P/L", f"${st.session_state.paper_realized_pnl:.2f}")
+        else:
+            st.metric("Live P/L", f"${live_pnl:.2f}")
+    with c_dash3:
+        if trading_mode == "PAPER TRADING":
+            st.metric("Unrealized P/L", f"${paper_unrealized:.2f}")
+        else:
+            st.metric("Live Balance", f"${live_bal:.2f}")
+    with c_dash4:
+        st.metric("Daily Spent", f"${daily_spent:.2f} / ${daily_cap:.2f}")
+    with c_dash5:
+        st.metric("Active Market", st.session_state.active_ticker or "--")
+    with c_dash6:
+        st.metric("🟢 UP Ask", st.session_state.up_ask_display)
+    with c_dash7:
+        st.metric("🔴 DOWN Ask", st.session_state.down_ask_display)
 
     if st.session_state.running and client:
         run_bot_cycle(client, daily_spent)
     elif not st.session_state.running:
-        st.info("Vortex is stopped. Enter your API credentials to stream live market data.")
+        st.info("Vortex is stopped. Choose your settings and press 'START VORTEX'.")
 
     if len(st.session_state.price_history) > 1:
-        st.subheader("📈 Live Streaming 100-Tick Price Momentum")
+        st.subheader("📈 200-Tick Historical Price Momentum (Memory Buffer)")
         st.line_chart(st.session_state.price_history, height=200)
+
+    if trading_mode == "PAPER TRADING" and any(p["contracts"] > 0 for p in st.session_state.paper_positions.values()):
+        st.subheader("💼 Active Paper Positions")
+        active_pos_list = []
+        for pk, p_data in st.session_state.paper_positions.items():
+            if p_data["contracts"] > 0:
+                active_pos_list.append({
+                    "Ticker": p_data["ticker"],
+                    "Outcome": p_data["outcome"],
+                    "Contracts": p_data["contracts"],
+                    "Avg Entry": f"${p_data['avg_cost']:.4f}",
+                    "Total Cost": f"${(p_data['contracts'] * p_data['avg_cost']):.2f}"
+                })
+        st.dataframe(active_pos_list, use_container_width=True, hide_index=True)
 
     st.subheader("🛒 Execution Log")
     if st.session_state.trade_logs:
@@ -881,9 +1051,9 @@ def render_dashboard_and_tick():
     else:
         st.info("No trades executed yet.")
 
-    st.subheader("📜 Vortex Diagnostic Log")
+    st.subheader("📜 Vortex Log (Turbo Buffer)")
     if st.session_state.logs:
-        st.code("\n".join(st.session_state.logs[-20:]))
+        st.code("\n".join(st.session_state.logs[-15:]))
     else:
         st.info("Waiting for Vortex activity...")
 
