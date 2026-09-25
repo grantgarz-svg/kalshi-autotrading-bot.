@@ -25,8 +25,8 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🌪️ Vortex Scalper Pro - 200-Tick Buffer & ROI Exits")
-st.caption("High-frequency Kalshi trading dashboard with a 200-tick rolling memory buffer and error-logged stop-losses")
+st.title("🌪️ Vortex Scalper Pro - Bulletproof Stop-Loss & Daily Tracker")
+st.caption("High-frequency Kalshi trading dashboard with instant live entry caching and error-logged stop-losses")
 
 
 # ============================================================
@@ -52,6 +52,7 @@ DEFAULTS = {
     "paper_trades": [],
     "paper_positions": {},      
     "paper_realized_pnl": ZERO, 
+    "live_entry_prices": {},    # Instant cache for live fill entry prices
     "starting_live_balance": None,
     "last_trade_time": None,
     "active_ticker": None,
@@ -291,7 +292,7 @@ def get_both_prices(client, ticker):
 def evaluate_historical_memory(price_history, intended_outcome):
     if len(price_history) < 5:
         return True
-    recent = price_history[-20:] # Evaluate momentum over a slightly broader recent window
+    recent = price_history[-20:]
     momentum = recent[-1] - recent[0]
     if intended_outcome == "YES":
         return momentum >= -3
@@ -328,7 +329,6 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         st.session_state.up_ask_display = f"{ask_up}¢" if ask_up > 0 else "--"
         st.session_state.down_ask_display = f"{ask_down}¢" if ask_down > 0 else "--"
 
-        # Expanded to track the last 200 ticks
         st.session_state.price_history.append(ask_up)
         st.session_state.price_history = st.session_state.price_history[-200:]
 
@@ -514,11 +514,12 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
     
     st.session_state.last_client_order_id = client_order_id
 
+    pos_key = f"{ticker}_{outcome}"
+
     if mode == "PAPER TRADING":
         contracts_d = D(contracts)
         price_d = D(outcome_cents) / D(100)
         
-        pos_key = f"{ticker}_{outcome}"
         if pos_key not in st.session_state.paper_positions:
             st.session_state.paper_positions[pos_key] = {"contracts": ZERO, "avg_cost": ZERO, "ticker": ticker, "outcome": outcome}
             
@@ -571,6 +572,12 @@ def submit_trade(client, mode, ticker, outcome, action, contracts, outcome_cents
 
         st.session_state.last_order_id = order_id
         st.session_state.last_fill_count = fill_count_value
+
+        # Instantly cache live entry price so stop-loss knows the exact entry price immediately
+        if action == "BUY":
+            st.session_state.live_entry_prices[pos_key] = D(outcome_cents) / D(100)
+        elif action == "SELL":
+            st.session_state.live_entry_prices.pop(pos_key, None)
 
         append_order_log({
             "timestamp": now_utc().isoformat(), "mode": mode, "ticker": ticker,
@@ -631,8 +638,16 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
 
     current = D(current_bid) / D(100)
 
+    # Use instantly cached live entry price if available, avoiding API fill-lag fallback bugs
+    pos_key = f"{ticker}_{outcome}"
+    if mode == "LIVE TRADING":
+        if pos_key in st.session_state.live_entry_prices:
+            avg_entry = st.session_state.live_entry_prices[pos_key]
+        elif avg_entry is None or avg_entry <= 0:
+            return False  # Wait for valid entry price rather than corrupting with current price
+
     if avg_entry is None or avg_entry <= 0:
-        avg_entry = current
+        return False
 
     roi_pct = ((current - avg_entry) / avg_entry) * D(100)
 
@@ -654,7 +669,8 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
     )
 
     if reason.startswith(("STOP LOSS", "TIME PANIC EXIT", "TAKE PROFIT")):
-        st.session_state.blacklisted_tickers.add(f"{ticker}_{outcome}")
+        st.session_state.blacklisted_tickers.add(pos_key)
+        st.session_state.live_entry_prices.pop(pos_key, None)
         st.session_state["last_status_log"] = None 
 
     return True
@@ -691,7 +707,7 @@ with st.sidebar:
     st.divider()
     st.header("💰 Risk & Panic Exit")
     max_dollars_trade = st.number_input("Maximum dollars per trade", min_value=0.01, max_value=10000.00, value=1.00, step=0.50)
-    daily_cap = st.number_input("Daily spending cap", min_value=0.01, max_value=100000.00, value=100.00, step=5.00)
+    daily_cap = st.number_input("Daily spending cap", min_value=0.01, max_value=100000.00, value=3.00, step=1.00)
     
     min_entry_up, max_entry_up = 15, 65
     min_entry_down, max_entry_down = 15, 65
@@ -778,7 +794,7 @@ with c1:
 
             st.session_state.running = True
             st.session_state.emergency_stop = False
-            log(f"Vortex Scalper Pro started with 200-tick buffer ({trading_mode}).")
+            log(f"Vortex Scalper Pro started ({trading_mode}).")
             st.rerun()
 
 with c2:
@@ -849,9 +865,15 @@ def run_bot_cycle(client, daily_spent):
         try:
             position_response = client.get_positions(ticker=ticker)
             position = extract_position(position_response, ticker, outcome_target=found_outcome)
-            fills_response = client.get_fills(ticker=ticker)
-            fills = fills_response.get("fills", [])
-            avg_entry = reconstruct_average_entry(fills, ticker, found_outcome)
+            # Check cached live entry price first, fallback to fill reconstruction if missing
+            if pos_key in st.session_state.live_entry_prices:
+                avg_entry = st.session_state.live_entry_prices[pos_key]
+            else:
+                fills_response = client.get_fills(ticker=ticker)
+                fills = fills_response.get("fills", [])
+                avg_entry = reconstruct_average_entry(fills, ticker, found_outcome)
+                if avg_entry:
+                    st.session_state.live_entry_prices[pos_key] = avg_entry
         except Exception:
             return
     else:
@@ -918,7 +940,7 @@ def run_bot_cycle(client, daily_spent):
 
 @st.fragment(run_every=1)
 def render_dashboard_and_tick():
-    st.subheader("🌪️ Vortex Dashboard & 200-Tick Scanner")
+    st.subheader("🌪️ Vortex Dashboard & Stop-Loss Tracker")
     
     client = None
     daily_spent = ZERO
@@ -978,7 +1000,7 @@ def render_dashboard_and_tick():
                         current_val = D(current_bid_cents) / D(100)
                         paper_unrealized += (current_val - p_data["avg_cost"]) * p_data["contracts"]
 
-    c_dash1, c_dash2, c_dash3, c_dash4, c_dash5, c_dash6 = st.columns(6)
+    c_dash1, c_dash2, c_dash3, c_dash4, c_dash5, c_dash6, c_dash7 = st.columns(7)
     with c_dash1:
         st.metric("Mode", trading_mode)
     with c_dash2:
@@ -992,10 +1014,12 @@ def render_dashboard_and_tick():
         else:
             st.metric("Live Balance", f"${live_bal:.2f}")
     with c_dash4:
-        st.metric("Active Market", st.session_state.active_ticker or "--")
+        st.metric("Daily Spent", f"${daily_spent:.2f} / ${daily_cap:.2f}")
     with c_dash5:
-        st.metric("🟢 UP Ask", st.session_state.up_ask_display)
+        st.metric("Active Market", st.session_state.active_ticker or "--")
     with c_dash6:
+        st.metric("🟢 UP Ask", st.session_state.up_ask_display)
+    with c_dash7:
         st.metric("🔴 DOWN Ask", st.session_state.down_ask_display)
 
     if st.session_state.running and client:
