@@ -25,8 +25,8 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🌪️ Vortex Scalper Pro - ROI Exits & Bulletproof Stop-Loss")
-st.caption("High-frequency Kalshi trading dashboard with exact return percentage tracking and error-logged stop-losses")
+st.title("🌪️ Vortex Scalper Pro - 200-Tick Buffer & ROI Exits")
+st.caption("High-frequency Kalshi trading dashboard with a 200-tick rolling memory buffer and error-logged stop-losses")
 
 
 # ============================================================
@@ -291,7 +291,7 @@ def get_both_prices(client, ticker):
 def evaluate_historical_memory(price_history, intended_outcome):
     if len(price_history) < 5:
         return True
-    recent = price_history[-10:]
+    recent = price_history[-20:] # Evaluate momentum over a slightly broader recent window
     momentum = recent[-1] - recent[0]
     if intended_outcome == "YES":
         return momentum >= -3
@@ -328,8 +328,9 @@ def find_active_market_with_liquidity(client, series_ticker, min_expiry_mins=0, 
         st.session_state.up_ask_display = f"{ask_up}¢" if ask_up > 0 else "--"
         st.session_state.down_ask_display = f"{ask_down}¢" if ask_down > 0 else "--"
 
+        # Expanded to track the last 200 ticks
         st.session_state.price_history.append(ask_up)
-        st.session_state.price_history = st.session_state.price_history[-100:]
+        st.session_state.price_history = st.session_state.price_history[-200:]
 
         if outcome_mode in ["YES", "BOTH"]:
             if min_up <= ask_up <= max_up:
@@ -675,7 +676,7 @@ with st.sidebar:
     private_key_text = st.text_area("Private Key PEM", value=private_key_default, height=180)
 
     st.divider()
-    st.header("📊 Market & Memory")
+    st.header("📊 Market & 200-Tick Memory")
     series_ticker = st.text_input("Market Series", value="KXBTC15M")
     display_outcome = st.selectbox("Entry outcome", ["UP", "DOWN", "BOTH (UP & DOWN)"])
     if display_outcome == "UP":
@@ -777,7 +778,7 @@ with c1:
 
             st.session_state.running = True
             st.session_state.emergency_stop = False
-            log(f"Vortex Scalper Pro started ({trading_mode}).")
+            log(f"Vortex Scalper Pro started with 200-tick buffer ({trading_mode}).")
             st.rerun()
 
 with c2:
@@ -917,7 +918,7 @@ def run_bot_cycle(client, daily_spent):
 
 @st.fragment(run_every=1)
 def render_dashboard_and_tick():
-    st.subheader("🌪️ Vortex Dashboard & Scanner")
+    st.subheader("🌪️ Vortex Dashboard & 200-Tick Scanner")
     
     client = None
     daily_spent = ZERO
@@ -1003,7 +1004,7 @@ def render_dashboard_and_tick():
         st.info("Vortex is stopped. Choose your settings and press 'START VORTEX'.")
 
     if len(st.session_state.price_history) > 1:
-        st.subheader("📈 Smooth Historical Price Momentum (Memory Buffer)")
+        st.subheader("📈 200-Tick Historical Price Momentum (Memory Buffer)")
         st.line_chart(st.session_state.price_history, height=200)
 
     if trading_mode == "PAPER TRADING" and any(p["contracts"] > 0 for p in st.session_state.paper_positions.values()):
