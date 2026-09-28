@@ -29,7 +29,7 @@ st.set_page_config(
 )
 
 st.title("🌪️ Vortex Scalper Pro - WebSocket Streaming Engine")
-st.caption("High-frequency Kalshi trading dashboard with live WebSocket ticks, universal position stop-losses, and 100-tick buffer")
+st.caption("High-frequency Kalshi trading dashboard with live WebSocket ticks, universal position stop-losses, and diagnostic logging")
 
 
 # ============================================================
@@ -631,6 +631,7 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
             return False
         current_bid = prices[outcome]["bid"]
         if current_bid <= 0:
+            log(f"⏳ Holding {ticker} {outcome}: Current order book bid is 0¢ (no active buyers yet).")
             return False
     except Exception as e:
         log(f"⚠️ Exit check API error for {ticker}: {e}")
@@ -643,9 +644,11 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
         if pos_key in st.session_state.live_entry_prices:
             avg_entry = st.session_state.live_entry_prices[pos_key]
         elif avg_entry is None or avg_entry <= 0:
+            log(f"⚠️ Holding {ticker}: Live entry price cache missing.")
             return False
 
     if avg_entry is None or avg_entry <= 0:
+        log(f"⚠️ Holding {ticker}: Average entry cost is invalid (${avg_entry}).")
         return False
 
     roi_pct = ((current - avg_entry) / avg_entry) * D(100)
@@ -659,6 +662,7 @@ def manage_position(client, mode, position, avg_entry, take_profit_pct, stop_los
         reason = f"TIME PANIC EXIT ({roi_pct:.2f}%)"
 
     if reason is None:
+        log_once(f"holding_{ticker}", f"📊 Holding {ticker} {outcome} | Entry: ${avg_entry:.4f} | Bid: ${current:.4f} | ROI: {roi_pct:+.2f}% (TP: +{take_profit_pct}%, SL: -{stop_loss_pct}%)")
         return False
 
     log(f"🌪️ VORTEX {reason}: {ticker} {outcome} entry=${avg_entry:.4f}, bid=${current:.4f}")
